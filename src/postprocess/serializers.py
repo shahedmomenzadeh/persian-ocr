@@ -226,8 +226,10 @@ def _markdown_frontmatter(doc: DocumentResult) -> str:
         f'model: "{meta.rec_model_label}"',
         f'model_variant: "{meta.rec_model_variant}"',
         f'device: "{meta.device}"',
+        f'spellcheck_mode: "{meta.spellcheck_mode}"',
         f"pages: {doc.page_count}",
         f"processing_time_sec: {doc.processing_time_sec:.3f}",
+        f"total_corrections: {doc.metrics.total_corrections if doc.metrics else 0}",
         f"peak_vram_mb: {peak_vram:.2f}" if peak_vram is not None else "peak_vram_mb: null",
         f"peak_rss_ram_mb: {peak_rss:.2f}" if peak_rss is not None else "peak_rss_ram_mb: null",
         f'created_at: "{meta.created_at}"',
@@ -385,6 +387,11 @@ def _render_html_run_banner(doc: DocumentResult) -> str:
         dev_label = f"{m.device} ({m.gpu_name})" if m.gpu_name else m.device
         chips.append(f'<span><strong>سخت‌افزار:</strong> <span dir="ltr">{html.escape(dev_label)}</span></span>')
         chips.append(f'<span><strong>DPI:</strong> {m.dpi}</span>')
+        if m.spellcheck_mode != "off":
+            corr_total = doc.metrics.total_corrections if doc.metrics else 0
+            chips.append(
+                f'<span><strong>اصلاح املایی:</strong> <span dir="ltr">{html.escape(m.spellcheck_mode)}</span> ({corr_total} مورد)</span>'
+            )
         chips.append(f'<span><strong>زمان اجرا:</strong> <span dir="ltr">{html.escape(m.created_at)}</span></span>')
 
     if doc.metrics is not None:
@@ -416,6 +423,7 @@ def _render_page_meta_bar(page: PageResult) -> str:
         return ""
     pm = page.metrics
     st = pm.stages
+    spell_part = f" spell={st.spellcheck_sec:.2f}s" if st.spellcheck_sec > 0 else ""
     parts = [
         f"صفحه {page.page_number}",
         f'<span dir="ltr">{pm.latency_sec:.2f}s</span>',
@@ -423,7 +431,7 @@ def _render_page_meta_bar(page: PageResult) -> str:
             '<span dir="ltr">'
             f"pre={st.preprocess_sec:.2f}s layout={st.layout_sec:.2f}s "
             f"det={st.detect_sec:.2f}s table={st.table_sec:.2f}s "
-            f"rec={st.recognize_sec:.2f}s post={st.postprocess_sec:.2f}s"
+            f"rec={st.recognize_sec:.2f}s post={st.postprocess_sec:.2f}s{spell_part}"
             "</span>"
         ),
     ]
@@ -432,6 +440,8 @@ def _render_page_meta_bar(page: PageResult) -> str:
     if pm.rss_ram_mb is not None:
         parts.append(f'RAM <span dir="ltr">{pm.rss_ram_mb:.1f} MB</span>')
     parts.append(f"{pm.num_blocks or len(page.blocks)} بلوک")
+    if pm.corrections_count > 0:
+        parts.append(f"{pm.corrections_count} اصلاح")
     return '    <div class="page-meta">' + " · ".join(parts) + "</div>\n"
 
 

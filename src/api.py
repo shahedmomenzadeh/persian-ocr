@@ -15,7 +15,7 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from config.settings import RecognizerVariant, Settings, configure_cache_env
+from config.settings import RecognizerVariant, Settings, SpellcheckMode, configure_cache_env
 from src.inference.recognizer import check_model_available
 from src.pipeline import DocumentPipeline
 from src.postprocess.serializers import VALID_FORMATS, parse_formats, to_html, to_markdown, to_text
@@ -40,25 +40,35 @@ _pipeline_lock = threading.Lock()
 _pipeline_instance: DocumentPipeline | None = None
 _active_model: RecognizerVariant = Settings().rec_model_variant
 _default_formats: list[str] = ["json"]
+_spellcheck_mode: SpellcheckMode = Settings().spellcheck_mode
 _total_requests: int = 0
 _last_run: dict[str, Any] | None = None
 
 
 class ConfigUpdateRequest(BaseModel):
-    """Runtime model and default output-format configuration."""
+    """Runtime model, spellcheck, and default output-format configuration."""
 
     model: RecognizerVariant | None = None
     out_formats: list[str] | str | None = None
+    spellcheck_mode: SpellcheckMode | None = None
     preload: bool = False
 
 
-def get_pipeline(model: RecognizerVariant | None = None) -> DocumentPipeline:
+def get_pipeline(
+    model: RecognizerVariant | None = None,
+    spellcheck_mode: SpellcheckMode | None = None,
+) -> DocumentPipeline:
     """Return the active DocumentPipeline, switching/unloading safely if model changes."""
     global _pipeline_instance, _active_model
+    target_spellcheck = spellcheck_mode or _spellcheck_mode
     with _pipeline_lock:
         if _pipeline_instance is not None and (
             model is None or _pipeline_instance.settings.rec_model_variant == model
         ):
+            if _pipeline_instance.settings.spellcheck_mode != target_spellcheck:
+                _pipeline_instance.settings = _pipeline_instance.settings.model_copy(
+                    update={"spellcheck_mode": target_spellcheck}
+                )
             return _pipeline_instance
 
         target_model = model or _active_model
@@ -66,7 +76,7 @@ def get_pipeline(model: RecognizerVariant | None = None) -> DocumentPipeline:
             _pipeline_instance.unload()
             _pipeline_instance = None
 
-        settings = Settings(rec_model_variant=target_model)
+        settings = Settings(rec_model_variant=target_model, spellcheck_mode=target_spellcheck)
         configure_cache_env(settings.models_dir)
         _pipeline_instance = DocumentPipeline(
             settings=settings,
@@ -136,6 +146,7 @@ def health() -> dict[str, Any]:
         "status": "ok",
         "active_model": pipeline.settings.rec_model_variant,
         "default_formats": list(_default_formats),
+        "spellcheck_mode": pipeline.settings.spellcheck_mode,
         "available_models": [
             v for v in ALL_MODELS if check_model_available(v, pipeline.settings)
         ],
@@ -185,8 +196,8 @@ def list_models() -> dict[str, Any]:
 @app.post("/config")
 @app.post("/models/select")
 def update_config(payload: ConfigUpdateRequest) -> dict[str, Any]:
-    """Set the default recognizer model and/or default output formats."""
-    global _active_model, _default_formats
+    """Set the default recognizer model, spellcheck mode, and/or default output formats."""
+    global _active_model, _default_formats, _spellcheck_mode
 
     if payload.out_formats is not None:
         try:
@@ -194,11 +205,14 @@ def update_config(payload: ConfigUpdateRequest) -> dict[str, Any]:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    if payload.spellcheck_mode is not None:
+        _spellcheck_mode = payload.spellcheck_mode
+
     if payload.model is not None:
         _active_model = payload.model
-        pipeline = get_pipeline(model=payload.model)
+        pipeline = get_pipeline(model=payload.model, spellcheck_mode=_spellcheck_mode)
     else:
-        pipeline = get_pipeline()
+        pipeline = get_pipeline(spellcheck_mode=_spellcheck_mode)
 
     if payload.preload:
         _ = pipeline.engine
@@ -207,6 +221,7 @@ def update_config(payload: ConfigUpdateRequest) -> dict[str, Any]:
         "status": "ok",
         "active_model": pipeline.settings.rec_model_variant,
         "default_formats": list(_default_formats),
+        "spellcheck_mode": pipeline.settings.spellcheck_mode,
         "engine_loaded": pipeline._engine is not None,
     }
 
@@ -223,6 +238,10 @@ async def process_document(
     formats: str | None = Query(
         None,
         description="Comma- or space-separated formats: json,md,html,txt.",
+    ),
+    spellcheck: SpellcheckMode | None = Query(
+        None,
+        description="Override spellcheck mode: off, lexicon, kenlm.",
     ),
     save_outputs: bool = Query(True, description="Save artifacts and manifest.json to output dir."),
 ) -> dict[str, Any]:
@@ -253,7 +272,7 @@ async def process_document(
             tmp.write(content)
             tmp_path = Path(tmp.name)
 
-        pipeline = get_pipeline(model=model)
+        pipeline = get_pipeline(model=model, spellcheck_mode=spellcheck)
         doc_result, written = await anyio.to_thread.run_sync(
             lambda: pipeline.process_file(
                 tmp_path,

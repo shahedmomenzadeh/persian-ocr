@@ -55,6 +55,17 @@ class StageTimings(BaseModel):
     table_sec: float = 0.0
     recognize_sec: float = 0.0
     postprocess_sec: float = 0.0
+    spellcheck_sec: float = 0.0
+
+
+class SpellcheckCorrection(BaseModel):
+    """Single OCR spellcheck rewrite recorded for auditability."""
+
+    page_number: int = 0
+    original: str
+    corrected: str
+    cost: float = 0.0
+    rule: str = "visual_lexicon"
 
 
 class PageMetrics(BaseModel):
@@ -68,6 +79,7 @@ class PageMetrics(BaseModel):
     num_lines: int = 0
     num_tables: int = 0
     char_count: int = 0
+    corrections_count: int = 0
 
 
 class PageResult(BaseModel):
@@ -94,6 +106,7 @@ class RunMetadata(BaseModel):
     gpu_name: str | None = None
     dpi: int = 200
     digit_policy: str = "persian"
+    spellcheck_mode: str = "off"
     pipeline_version: str = "0.1.0"
 
 
@@ -108,6 +121,8 @@ class DocumentMetrics(BaseModel):
     total_lines: int = 0
     total_tables: int = 0
     total_chars: int = 0
+    total_corrections: int = 0
+    corrections: list[SpellcheckCorrection] = Field(default_factory=list)
     stage_totals: StageTimings = Field(default_factory=StageTimings)
 
 

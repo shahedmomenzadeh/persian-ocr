@@ -10,6 +10,7 @@ from typing import Literal
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 RecognizerVariant = Literal["bina-0.2-rizehpizeh", "bina-0.2-rizeh", "bina-0.4-koochik"]
+SpellcheckMode = Literal["off", "lexicon", "kenlm"]
 
 
 class Settings(BaseSettings):
@@ -57,6 +58,9 @@ class Settings(BaseSettings):
 
     # Persian post-processing
     digit_policy: Literal["persian", "latin", "preserve"] = "persian"
+    spellcheck_mode: SpellcheckMode = "lexicon"
+    spellcheck_custom_dict: Path | None = None
+    spellcheck_kenlm_path: Path | None = None
 
 
 def configure_cache_env(models_dir: Path | str | None = None) -> dict[str, str]:

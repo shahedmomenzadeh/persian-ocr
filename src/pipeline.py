@@ -17,6 +17,7 @@ from src.ingestion.preprocessor import preprocess_page
 from src.postprocess.normalizer import normalize_persian
 from src.postprocess.rtl_order import sort_blocks_rtl
 from src.postprocess.serializers import VALID_FORMATS, _cells_to_html_table, parse_formats
+from src.postprocess.spellcheck import get_spellchecker
 from src.schemas.document import (
     DocumentMetrics,
     DocumentResult,
@@ -24,6 +25,7 @@ from src.schemas.document import (
     PageMetrics,
     PageResult,
     RunMetadata,
+    SpellcheckCorrection,
     StageTimings,
     TableCell,
     TextLine,
@@ -69,11 +71,21 @@ class DocumentPipeline:
             self._engine.unload()
         self._engine = None
 
-    def _postprocess_page(self, page: PageResult) -> PageResult:
-        """Apply RTL block/line sorting and Persian Unicode normalization to a page."""
+    def _postprocess_page(
+        self,
+        page: PageResult,
+    ) -> tuple[PageResult, float, list[SpellcheckCorrection]]:
+        """Apply RTL sorting, Persian Unicode normalization, and optional OCR spellcheck."""
         ordered_blocks = sort_blocks_rtl(page.blocks, page_width=page.width)
         normalized_blocks: list[LayoutBlock] = []
         policy = self.settings.digit_policy
+        spellchecker = get_spellchecker(
+            self.settings.spellcheck_mode,
+            custom_dict=self.settings.spellcheck_custom_dict,
+            kenlm_path=self.settings.spellcheck_kenlm_path,
+        )
+        page_corrections: list[SpellcheckCorrection] = []
+        spellcheck_sec = 0.0
 
         for block in ordered_blocks:
             norm_lines = [
@@ -89,10 +101,50 @@ class DocumentPipeline:
                 )
                 for cell in block.cells
             ]
+
+            if spellchecker is not None:
+                t_sp0 = time.perf_counter()
+                if norm_lines and not norm_cells:
+                    corrected_lines: list[TextLine] = []
+                    for ln in norm_lines:
+                        fixed_txt, corrs = spellchecker.correct_text(
+                            ln.text, page_number=page.page_number
+                        )
+                        page_corrections.extend(corrs)
+                        corrected_lines.append(ln.model_copy(update={"text": fixed_txt}))
+                    norm_lines = corrected_lines
+
+                if norm_cells:
+                    corrected_cells: list[TableCell] = []
+                    for cell in norm_cells:
+                        fixed_txt, corrs = spellchecker.correct_text(
+                            cell.text, page_number=page.page_number
+                        )
+                        page_corrections.extend(corrs)
+                        corrected_cells.append(cell.model_copy(update={"text": fixed_txt}))
+                    norm_cells = corrected_cells
+                    # Also keep lines consistent for table blocks when lines were derived from cells
+                    if norm_lines:
+                        corrected_lines = []
+                        for ln in norm_lines:
+                            fixed_txt, _ = spellchecker.correct_text(
+                                ln.text, page_number=page.page_number
+                            )
+                            corrected_lines.append(ln.model_copy(update={"text": fixed_txt}))
+                        norm_lines = corrected_lines
+                spellcheck_sec += time.perf_counter() - t_sp0
+
             if norm_lines:
                 block_text = "\n".join(ln.text for ln in norm_lines if ln.text)
             else:
                 block_text = normalize_persian(block.text, digit_policy=policy)
+                if spellchecker is not None and block_text:
+                    t_sp0 = time.perf_counter()
+                    block_text, corrs = spellchecker.correct_text(
+                        block_text, page_number=page.page_number
+                    )
+                    page_corrections.extend(corrs)
+                    spellcheck_sec += time.perf_counter() - t_sp0
 
             updated_html = _cells_to_html_table(norm_cells) if norm_cells else block.html
 
@@ -107,7 +159,11 @@ class DocumentPipeline:
                 )
             )
 
-        return page.model_copy(update={"blocks": normalized_blocks})
+        return (
+            page.model_copy(update={"blocks": normalized_blocks}),
+            round(spellcheck_sec, 3),
+            page_corrections,
+        )
 
     def _build_run_metadata(self, pages: list[PageResult]) -> RunMetadata:
         """Build provenance metadata from active engine/recognizer or settings."""
@@ -156,10 +212,15 @@ class DocumentPipeline:
             gpu_name=gpu_name,
             dpi=self.settings.dpi,
             digit_policy=self.settings.digit_policy,
+            spellcheck_mode=self.settings.spellcheck_mode,
         )
 
     @staticmethod
-    def _build_document_metrics(pages: list[PageResult], total_sec: float) -> DocumentMetrics:
+    def _build_document_metrics(
+        pages: list[PageResult],
+        total_sec: float,
+        corrections: list[SpellcheckCorrection] | None = None,
+    ) -> DocumentMetrics:
         """Aggregate page-level latency, memory peaks, stage timings, and content counts."""
         latencies = [p.metrics.latency_sec for p in pages if p.metrics is not None]
         vrams = [
@@ -184,12 +245,16 @@ class DocumentPipeline:
             postprocess_sec=round(
                 sum(p.metrics.stages.postprocess_sec for p in pages if p.metrics), 3
             ),
+            spellcheck_sec=round(
+                sum(p.metrics.stages.spellcheck_sec for p in pages if p.metrics), 3
+            ),
         )
 
         total_blocks = sum(len(p.blocks) for p in pages)
         total_lines = sum(sum(len(b.lines) for b in p.blocks) for p in pages)
         total_tables = sum(sum(1 for b in p.blocks if b.type == "table") for p in pages)
         total_chars = sum(sum(len(b.text) for b in p.blocks) for p in pages)
+        all_corrs = corrections or []
 
         return DocumentMetrics(
             total_sec=total_sec,
@@ -200,6 +265,8 @@ class DocumentPipeline:
             total_lines=total_lines,
             total_tables=total_tables,
             total_chars=total_chars,
+            total_corrections=len(all_corrs),
+            corrections=all_corrs[:200],
             stage_totals=stage_totals,
         )
 
@@ -219,6 +286,7 @@ class DocumentPipeline:
 
         start_time = time.perf_counter()
         pages: list[PageResult] = []
+        all_corrections: list[SpellcheckCorrection] = []
         doc_id = uuid.uuid4().hex[:12]
 
         for page_input in load_document_pages(src_path, dpi=self.settings.dpi):
@@ -278,14 +346,16 @@ class DocumentPipeline:
                     del bgr_img
 
                 t_post0 = time.perf_counter()
-                page_res = self._postprocess_page(raw_page)
+                page_res, spell_sec, page_corrs = self._postprocess_page(raw_page)
                 post_sec = round(time.perf_counter() - t_post0, 3)
+                all_corrections.extend(page_corrs)
 
                 if page_res.metrics is not None:
                     updated_stages = page_res.metrics.stages.model_copy(
                         update={
                             "preprocess_sec": pre_sec,
                             "postprocess_sec": post_sec,
+                            "spellcheck_sec": spell_sec,
                         }
                     )
                     updated_metrics = page_res.metrics.model_copy(
@@ -295,6 +365,7 @@ class DocumentPipeline:
                             "num_lines": sum(len(b.lines) for b in page_res.blocks),
                             "num_tables": sum(1 for b in page_res.blocks if b.type == "table"),
                             "char_count": sum(len(b.text) for b in page_res.blocks),
+                            "corrections_count": len(page_corrs),
                         }
                     )
                     page_res = page_res.model_copy(update={"metrics": updated_metrics})
@@ -303,7 +374,9 @@ class DocumentPipeline:
 
         total_sec = round(time.perf_counter() - start_time, 3)
         metadata = self._build_run_metadata(pages)
-        doc_metrics = self._build_document_metrics(pages, total_sec=total_sec)
+        doc_metrics = self._build_document_metrics(
+            pages, total_sec=total_sec, corrections=all_corrections
+        )
         doc_result = DocumentResult(
             doc_id=doc_id,
             source_filename=effective_name,

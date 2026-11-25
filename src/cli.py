@@ -8,7 +8,7 @@ from typing import Literal, cast
 
 import typer
 
-from config.settings import RecognizerVariant, Settings, configure_cache_env
+from config.settings import RecognizerVariant, Settings, SpellcheckMode, configure_cache_env
 from src.ingestion.pdf_loader import SUPPORTED_IMAGE_EXTENSIONS
 from src.pipeline import DocumentPipeline
 from src.postprocess.serializers import parse_formats
@@ -85,6 +85,11 @@ def run(
     dpi: int | None = typer.Option(None, "--dpi", help="PDF rasterization DPI."),
     no_tables: bool = typer.Option(False, "--no-tables", help="Disable table structure recognition."),
     no_manifest: bool = typer.Option(False, "--no-manifest", help="Skip saving manifest.json alongside outputs."),
+    spellcheck: SpellcheckMode | None = typer.Option(
+        None,
+        "--spellcheck",
+        help="Persian OCR spellcheck mode: off, lexicon, or kenlm.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
     """Run Persian OCR on a file or directory and save structured labeled outputs."""
@@ -124,9 +129,14 @@ def run(
             settings = settings.model_copy(update={"dpi": dpi})
         if no_tables:
             settings = settings.model_copy(update={"enable_tables": False})
+        if spellcheck is not None:
+            settings = settings.model_copy(update={"spellcheck_mode": spellcheck})
         configure_cache_env(settings.models_dir)
 
-        typer.echo(f"=== Model [{m_idx}/{len(models_to_run)}]: {variant} (formats={','.join(fmt_list)}) ===")
+        typer.echo(
+            f"=== Model [{m_idx}/{len(models_to_run)}]: {variant} "
+            f"(formats={','.join(fmt_list)}, spellcheck={settings.spellcheck_mode}) ==="
+        )
         pipeline = DocumentPipeline(settings=settings, storage=storage)
         try:
             for idx, file_path in enumerate(files, start=1):
@@ -150,16 +160,22 @@ def run(
                     )
                     lat_str = f"{metrics.latency_sec:.2f}s" if metrics else "n/a"
                     stage_str = ""
+                    corr_str = ""
                     if metrics is not None:
                         st = metrics.stages
+                        spell_part = (
+                            f" spell={st.spellcheck_sec:.2f}s" if st.spellcheck_sec > 0 else ""
+                        )
                         stage_str = (
                             f" [pre={st.preprocess_sec:.2f}s layout={st.layout_sec:.2f}s "
                             f"det={st.detect_sec:.2f}s table={st.table_sec:.2f}s "
-                            f"rec={st.recognize_sec:.2f}s post={st.postprocess_sec:.2f}s]"
+                            f"rec={st.recognize_sec:.2f}s post={st.postprocess_sec:.2f}s{spell_part}]"
                         )
+                        if metrics.corrections_count > 0:
+                            corr_str = f", corr={metrics.corrections_count}"
                     typer.echo(
                         f"  Page {page.page_number}: blocks={len(page.blocks)}, "
-                        f"latency={lat_str}{stage_str}, peak_vram={vram_str}, rss_ram={ram_str}"
+                        f"latency={lat_str}{stage_str}{corr_str}, peak_vram={vram_str}, rss_ram={ram_str}"
                     )
                 typer.echo(
                     f"  Done in {doc_result.processing_time_sec:.2f}s -> "
