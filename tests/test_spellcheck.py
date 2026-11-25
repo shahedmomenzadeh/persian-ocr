@@ -1,6 +1,10 @@
-"""Unit tests for Phase 1 Persian OCR-weighted lexicon spellchecker."""
+"""Unit and integration tests for Phase 1 & Phase 2 Persian OCR spellchecker."""
 
 from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
 
 from src.postprocess.normalizer import ZWNJ
 from src.postprocess.spellcheck import (
@@ -73,3 +77,73 @@ def test_kenlm_mode_gracefully_falls_back_to_lexicon_when_missing() -> None:
     assert isinstance(checker, PersianSpellchecker)
     fixed, _ = checker.correct_text("گشور")
     assert fixed == "کشور"
+
+
+def test_kenlm_real_word_rescoring_respects_confidence_and_margin() -> None:
+    lexicon = PersianLexicon.build()
+
+    class _MockKenLM:
+        def __init__(self, gain: float = 4.0) -> None:
+            self.gain = gain
+
+        def BeginSentenceWrite(self, state) -> None:  # noqa: N802
+            return None
+
+        def BaseScore(self, prev_state, word: str, out_state) -> float:  # noqa: N802
+            if word == "اسناد":
+                return -1.0
+            if word == "استاد":
+                return -1.0 - self.gain
+            return -2.0
+
+    checker = PersianSpellchecker(
+        lexicon=lexicon,
+        mode="kenlm",
+        kenlm_model=_MockKenLM(gain=4.0),
+        real_word_conf_threshold=0.94,
+        real_word_lm_margin=2.0,
+    )
+
+    fixed_low, corrs_low = checker.correct_text("سازمان ثبت استاد", page_number=1, line_confidence=0.90)
+    assert fixed_low == "سازمان ثبت اسناد"
+    assert any(c.rule == "kenlm_context" and c.original == "استاد" and c.corrected == "اسناد" for c in corrs_low)
+
+    fixed_high, corrs_high = checker.correct_text("سازمان ثبت استاد", page_number=1, line_confidence=0.98)
+    assert fixed_high == "سازمان ثبت استاد"
+    assert corrs_high == []
+
+    weak_checker = PersianSpellchecker(
+        lexicon=lexicon,
+        mode="kenlm",
+        kenlm_model=_MockKenLM(gain=1.0),  # Below 2.0 margin
+        real_word_conf_threshold=0.94,
+        real_word_lm_margin=2.0,
+    )
+    fixed_weak, corrs_weak = weak_checker.correct_text("سازمان ثبت استاد", page_number=1, line_confidence=0.90)
+    assert fixed_weak == "سازمان ثبت استاد"
+    assert corrs_weak == []
+
+
+@pytest.mark.skipif(
+    not Path("models/kenlm/persian_5gram_4bit.binary").is_file(),
+    reason="Persian 5-gram KenLM binary not downloaded",
+)
+def test_real_persian_kenlm_fixes_contextual_and_oov_errors() -> None:
+    checker = get_spellchecker(
+        "kenlm",
+        kenlm_path="models/kenlm/persian_5gram_4bit.binary",
+        real_word_conf_threshold=0.94,
+    )
+    assert checker is not None
+
+    fixed1, corrs1 = checker.correct_text("سازمان ثبت استاد", page_number=1, line_confidence=0.90)
+    assert fixed1 == "سازمان ثبت اسناد"
+    assert any(c.rule == "kenlm_context" for c in corrs1)
+
+    fixed2, _ = checker.correct_text("و املاگ گشور", page_number=1, line_confidence=0.90)
+    assert fixed2 == "و املاک کشور"
+
+    clean = "زمان اعلام نتایج آزمون اوایل تیرماه خواهد بود"
+    fixed3, corrs3 = checker.correct_text(clean, page_number=2, line_confidence=0.90)
+    assert fixed3 == clean
+    assert corrs3 == []

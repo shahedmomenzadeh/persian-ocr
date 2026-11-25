@@ -69,6 +69,14 @@ MODEL_SPECS: dict[str, ModelSpec] = {
             "hf_nemotron_parse_modeling.py",
         ],
     ),
+    "persian-kenlm": ModelSpec(
+        name="persian-kenlm",
+        repo_id="PouyaZX4/persian-5gram-kenlm",
+        default_dir=Path("models/kenlm"),
+        kind="kenlm",
+        allow_patterns=["persian_5gram_4bit.binary", "README.md"],
+        required_files=["persian_5gram_4bit.binary"],
+    ),
 }
 
 
@@ -131,7 +139,7 @@ def verify_model_dir(spec: ModelSpec, target_dir: Path) -> bool:
     weight_files = [
         p
         for p in target_dir.rglob("*")
-        if p.is_file() and p.suffix in {".pdiparams", ".safetensors", ".bin", ".onnx"}
+        if p.is_file() and p.suffix in {".pdiparams", ".safetensors", ".bin", ".onnx", ".binary", ".klm"}
     ]
     if not weight_files:
         print(f"[FAIL] [{spec.name}] No weight files found under {target_dir}")

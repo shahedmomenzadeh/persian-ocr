@@ -385,17 +385,21 @@ def _split_edge_punct(token: str) -> tuple[str, str, str]:
 
 
 class PersianSpellchecker:
-    """OCR-weighted Persian lexicon spellchecker with optional KenLM rescoring hook."""
+    """OCR-weighted Persian lexicon spellchecker with optional KenLM contextual rescoring."""
 
     def __init__(
         self,
         lexicon: PersianLexicon,
         mode: SpellcheckMode = "lexicon",
         kenlm_model: Any | None = None,
+        real_word_conf_threshold: float = 0.94,
+        real_word_lm_margin: float = 2.0,
     ) -> None:
         self.lexicon = lexicon
         self.mode = mode
         self._kenlm = kenlm_model
+        self.real_word_conf_threshold = real_word_conf_threshold
+        self.real_word_lm_margin = real_word_lm_margin
 
     def _generate_candidates(self, word: str) -> set[str]:
         """Generate in-lexicon candidates via visual swaps and SymSpell 1-delete lookups."""
@@ -464,16 +468,15 @@ class PersianSpellchecker:
                     best = (freq, candidate)
         return best[1] if best is not None else None
 
-    def _select_best_candidate(
+    def _collect_oov_candidates(
         self,
         core: str,
-        left_ctx: str = "",
-        right_ctx: str = "",
-    ) -> tuple[str, float, str] | None:
-        """Return (best_candidate, cost, rule) for an OOV Persian word, or None."""
+        limit: int = 6,
+    ) -> list[tuple[str, float, str]]:
+        """Collect sorted OOV candidates (cand, cost, rule) passing Phase 1 thresholds."""
         zwnj_hit = self._try_zwnj_compound(core)
         if zwnj_hit is not None:
-            return zwnj_hit, 0.20, "zwnj_join"
+            return [(zwnj_hit, 0.20, "zwnj_join")]
 
         word_len = len(core.replace(ZWNJ, ""))
         if word_len == 3:
@@ -491,19 +494,139 @@ class PersianSpellchecker:
             dist = weighted_ocr_distance(core, cand, max_cost=max_cost)
             if dist > max_cost:
                 continue
-            # Lower objective is better: prioritize OCR visual closeness, break ties with log freq
-            lm_bonus = 0.0
-            if self.mode == "kenlm" and self._kenlm is not None:
-                phrase = " ".join(p for p in (left_ctx, cand, right_ctx) if p)
-                lm_bonus = float(self._kenlm.score(phrase, bos=False, eos=False)) * 0.04
-            objective = dist - 0.03 * math.log10(freq + 1e-12) - lm_bonus
+            objective = dist - 0.03 * math.log10(freq + 1e-12)
             scored.append((objective, dist, cand))
 
         if not scored:
-            return None
+            return []
         scored.sort(key=lambda item: item[0])
-        _, best_dist, best_cand = scored[0]
-        return best_cand, round(best_dist, 3), "visual_lexicon"
+        return [(cand, round(dist, 3), "visual_lexicon") for _, dist, cand in scored[:limit]]
+
+    def _select_best_candidate(
+        self,
+        core: str,
+    ) -> tuple[str, float, str] | None:
+        """Return (best_candidate, cost, rule) for an OOV Persian word, or None."""
+        cands = self._collect_oov_candidates(core, limit=1)
+        return cands[0] if cands else None
+
+    def _real_word_visual_neighbors(self, core: str, limit: int = 5) -> list[str]:
+        """Generate strict 1-char dot-confusion in-vocab neighbors for real-word rescoring."""
+        if len(core.replace(ZWNJ, "")) < 3:
+            return []
+        if self.lexicon.get_freq(core) >= 1e-3:
+            return []
+
+        neighbors: list[tuple[float, str]] = []
+        seen: set[str] = set()
+        for idx, ch in enumerate(core):
+            for alt in _CONFUSION_NEIGHBORS.get(ch, ()):
+                if _CONFUSION_COSTS.get((ch, alt), 1.0) > 0.25:
+                    continue
+                cand = core[:idx] + alt + core[idx + 1 :]
+                if cand == core or cand in seen:
+                    continue
+                freq = self.lexicon.get_freq(cand)
+                if freq >= 1e-5:
+                    seen.add(cand)
+                    neighbors.append((freq, cand))
+
+        neighbors.sort(key=lambda item: item[0], reverse=True)
+        return [cand for _, cand in neighbors[:limit]]
+
+    def _rescore_line_kenlm(
+        self,
+        words: list[str],
+        page_number: int,
+        line_confidence: float | None,
+    ) -> tuple[list[str], list[SpellcheckCorrection]]:
+        """Beam-search rescore OOV + low-confidence real-word visual neighbors with KenLM."""
+        assert self._kenlm is not None
+        lattice: list[tuple[str, str, str, list[tuple[str, float, str]]]] = []
+        allow_real_word = len(words) >= 2 and (
+            line_confidence is None or line_confidence < self.real_word_conf_threshold
+        )
+
+        for tok in words:
+            lead, core, trail = _split_edge_punct(tok)
+            if _is_protected_core(core):
+                lattice.append((lead, core, trail, [(core, 0.0, "keep")]))
+                continue
+
+            if self.lexicon.is_known(core):
+                cands: list[tuple[str, float, str]] = [(core, 0.0, "keep")]
+                if allow_real_word:
+                    for neighbor in self._real_word_visual_neighbors(core):
+                        cands.append((neighbor, 0.25, "kenlm_context"))
+                lattice.append((lead, core, trail, cands))
+                continue
+
+            oov_cands = self._collect_oov_candidates(core, limit=6)
+            if oov_cands:
+                lattice.append((lead, core, trail, [*oov_cands, (core, 2.2, "keep")]))
+            else:
+                lattice.append((lead, core, trail, [(core, 0.0, "keep")]))
+
+        if all(len(cands) <= 1 for _, _, _, cands in lattice):
+            return words, []
+
+        try:
+            import kenlm as _kenlm_mod
+
+            make_state = _kenlm_mod.State
+        except ImportError:
+            make_state = lambda: object()  # noqa: E731
+
+        init_state = make_state()
+        self._kenlm.BeginSentenceWrite(init_state)
+        beam_width = 8
+        beam: list[tuple[float, Any, list[tuple[str, float, str]]]] = [(0.0, init_state, [])]
+
+        for _, _, _, cands in lattice:
+            next_beam: list[tuple[float, Any, list[tuple[str, float, str]]]] = []
+            for prev_score, prev_state, path in beam:
+                for cand, cost, rule in cands:
+                    out_state = make_state()
+                    lm_step = float(self._kenlm.BaseScore(prev_state, cand, out_state))
+                    if rule == "keep":
+                        penalty = cost
+                    elif rule in {"visual_lexicon", "zwnj_join"}:
+                        penalty = 1.8 * cost
+                    elif rule == "kenlm_context":
+                        penalty = self.real_word_lm_margin
+                    else:
+                        penalty = cost
+                    next_beam.append(
+                        (prev_score + lm_step - penalty, out_state, [*path, (cand, cost, rule)])
+                    )
+            next_beam.sort(key=lambda item: item[0], reverse=True)
+            beam = next_beam[:beam_width]
+
+        best_total: float | None = None
+        best_path: list[tuple[str, float, str]] = []
+        for score, state, path in beam:
+            end_state = make_state()
+            eos_score = float(self._kenlm.BaseScore(state, "</s>", end_state))
+            total = score + eos_score
+            if best_total is None or total > best_total:
+                best_total = total
+                best_path = path
+
+        final_words: list[str] = []
+        corrections: list[SpellcheckCorrection] = []
+        for (lead, core, trail, _), (cand, cost, rule) in zip(lattice, best_path):
+            final_words.append(f"{lead}{cand}{trail}")
+            if cand != core:
+                corrections.append(
+                    SpellcheckCorrection(
+                        page_number=page_number,
+                        original=core,
+                        corrected=cand,
+                        cost=cost,
+                        rule=rule,
+                    )
+                )
+        return final_words, corrections
 
     def _join_adjacent_splits(
         self,
@@ -583,8 +706,9 @@ class PersianSpellchecker:
         self,
         line: str,
         page_number: int = 0,
+        line_confidence: float | None = None,
     ) -> tuple[str, list[SpellcheckCorrection]]:
-        """Apply split-join and OOV visual-confusion spellcheck on a single line."""
+        """Apply split-join and OOV / contextual KenLM spellcheck on a single line."""
         if not line or not line.strip() or not _PERSIAN_LETTER_RE.search(line):
             return line, []
 
@@ -599,32 +723,38 @@ class PersianSpellchecker:
         words, join_corrs = self._join_adjacent_splits(words, page_number=page_number)
         corrections.extend(join_corrs)
 
-        # Pass 2: single-token OOV correction
-        final_words: list[str] = []
-        for idx, tok in enumerate(words):
-            lead, core, trail = _split_edge_punct(tok)
-            if _is_protected_core(core) or self.lexicon.is_known(core):
-                final_words.append(tok)
-                continue
-
-            left_ctx = _split_edge_punct(words[idx - 1])[1] if idx > 0 else ""
-            right_ctx = _split_edge_punct(words[idx + 1])[1] if idx + 1 < len(words) else ""
-            match = self._select_best_candidate(core, left_ctx=left_ctx, right_ctx=right_ctx)
-            if match is None:
-                final_words.append(tok)
-                continue
-
-            cand, cost, rule = match
-            corrections.append(
-                SpellcheckCorrection(
-                    page_number=page_number,
-                    original=core,
-                    corrected=cand,
-                    cost=cost,
-                    rule=rule,
-                )
+        if self.mode == "kenlm" and self._kenlm is not None:
+            final_words, rescore_corrs = self._rescore_line_kenlm(
+                words,
+                page_number=page_number,
+                line_confidence=line_confidence,
             )
-            final_words.append(f"{lead}{cand}{trail}")
+            corrections.extend(rescore_corrs)
+        else:
+            # Phase 1: independent single-token OOV correction
+            final_words = []
+            for tok in words:
+                lead, core, trail = _split_edge_punct(tok)
+                if _is_protected_core(core) or self.lexicon.is_known(core):
+                    final_words.append(tok)
+                    continue
+
+                match = self._select_best_candidate(core)
+                if match is None:
+                    final_words.append(tok)
+                    continue
+
+                cand, cost, rule = match
+                corrections.append(
+                    SpellcheckCorrection(
+                        page_number=page_number,
+                        original=core,
+                        corrected=cand,
+                        cost=cost,
+                        rule=rule,
+                    )
+                )
+                final_words.append(f"{lead}{cand}{trail}")
 
         if not corrections:
             return line, []
@@ -645,6 +775,7 @@ class PersianSpellchecker:
         self,
         text: str,
         page_number: int = 0,
+        line_confidence: float | None = None,
     ) -> tuple[str, list[SpellcheckCorrection]]:
         """Spellcheck multi-line text while preserving line breaks."""
         if not text:
@@ -652,7 +783,11 @@ class PersianSpellchecker:
         all_corrs: list[SpellcheckCorrection] = []
         out_lines: list[str] = []
         for line in text.splitlines():
-            fixed, corrs = self.correct_line(line, page_number=page_number)
+            fixed, corrs = self.correct_line(
+                line,
+                page_number=page_number,
+                line_confidence=line_confidence,
+            )
             out_lines.append(fixed)
             all_corrs.extend(corrs)
         return "\n".join(out_lines), all_corrs
@@ -669,6 +804,7 @@ def _get_cached_spellchecker(
     mode: SpellcheckMode,
     custom_dict_str: str,
     kenlm_path_str: str,
+    real_word_conf_threshold: float,
 ) -> PersianSpellchecker | None:
     if mode == "off":
         return None
@@ -681,8 +817,10 @@ def _get_cached_spellchecker(
             try:
                 import kenlm  # type: ignore[import-not-found]
 
-                kenlm_model = kenlm.Model(kenlm_path_str)
-                logger.info("Loaded KenLM model from %s", kenlm_path_str)
+                cfg = kenlm.Config()
+                cfg.load_method = kenlm.LoadMethod.LAZY
+                kenlm_model = kenlm.Model(kenlm_path_str, cfg)
+                logger.info("Loaded KenLM model (LAZY mmap) from %s", kenlm_path_str)
             except Exception as exc:
                 logger.warning("Failed to load KenLM (%s); falling back to lexicon mode.", exc)
                 eff_mode = "lexicon"
@@ -690,17 +828,23 @@ def _get_cached_spellchecker(
             logger.warning("SPELLCHECK_MODE=kenlm requested without valid model file; using lexicon mode.")
             eff_mode = "lexicon"
 
-    return PersianSpellchecker(lexicon=lexicon, mode=eff_mode, kenlm_model=kenlm_model)
+    return PersianSpellchecker(
+        lexicon=lexicon,
+        mode=eff_mode,
+        kenlm_model=kenlm_model,
+        real_word_conf_threshold=real_word_conf_threshold,
+    )
 
 
 def get_spellchecker(
     mode: SpellcheckMode,
     custom_dict: Path | str | None = None,
     kenlm_path: Path | str | None = None,
+    real_word_conf_threshold: float = 0.94,
 ) -> PersianSpellchecker | None:
     """Return cached PersianSpellchecker for mode, or None when mode == 'off'."""
     if mode == "off":
         return None
     custom_str = str(Path(custom_dict).resolve()) if custom_dict else ""
     kenlm_str = str(Path(kenlm_path).resolve()) if kenlm_path else ""
-    return _get_cached_spellchecker(mode, custom_str, kenlm_str)
+    return _get_cached_spellchecker(mode, custom_str, kenlm_str, real_word_conf_threshold)

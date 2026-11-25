@@ -60,7 +60,8 @@ class Settings(BaseSettings):
     digit_policy: Literal["persian", "latin", "preserve"] = "persian"
     spellcheck_mode: SpellcheckMode = "lexicon"
     spellcheck_custom_dict: Path | None = None
-    spellcheck_kenlm_path: Path | None = None
+    spellcheck_kenlm_path: Path | None = Path("./models/kenlm/persian_5gram_4bit.binary")
+    spellcheck_real_word_conf_threshold: float = 0.94
 
 
 def configure_cache_env(models_dir: Path | str | None = None) -> dict[str, str]:

@@ -83,6 +83,7 @@ class DocumentPipeline:
             self.settings.spellcheck_mode,
             custom_dict=self.settings.spellcheck_custom_dict,
             kenlm_path=self.settings.spellcheck_kenlm_path,
+            real_word_conf_threshold=self.settings.spellcheck_real_word_conf_threshold,
         )
         page_corrections: list[SpellcheckCorrection] = []
         spellcheck_sec = 0.0
@@ -108,7 +109,9 @@ class DocumentPipeline:
                     corrected_lines: list[TextLine] = []
                     for ln in norm_lines:
                         fixed_txt, corrs = spellchecker.correct_text(
-                            ln.text, page_number=page.page_number
+                            ln.text,
+                            page_number=page.page_number,
+                            line_confidence=ln.confidence,
                         )
                         page_corrections.extend(corrs)
                         corrected_lines.append(ln.model_copy(update={"text": fixed_txt}))
@@ -118,7 +121,9 @@ class DocumentPipeline:
                     corrected_cells: list[TableCell] = []
                     for cell in norm_cells:
                         fixed_txt, corrs = spellchecker.correct_text(
-                            cell.text, page_number=page.page_number
+                            cell.text,
+                            page_number=page.page_number,
+                            line_confidence=cell.confidence,
                         )
                         page_corrections.extend(corrs)
                         corrected_cells.append(cell.model_copy(update={"text": fixed_txt}))
@@ -128,7 +133,9 @@ class DocumentPipeline:
                         corrected_lines = []
                         for ln in norm_lines:
                             fixed_txt, _ = spellchecker.correct_text(
-                                ln.text, page_number=page.page_number
+                                ln.text,
+                                page_number=page.page_number,
+                                line_confidence=ln.confidence,
                             )
                             corrected_lines.append(ln.model_copy(update={"text": fixed_txt}))
                         norm_lines = corrected_lines
