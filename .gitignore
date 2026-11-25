@@ -1,0 +1,21 @@
+# Virtual environments & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# Environment secrets
+.env
+
+# Local model weights, data & outputs
+models/
+data/
+out/
+*.log

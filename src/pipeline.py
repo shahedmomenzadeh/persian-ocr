@@ -1,0 +1,341 @@
+"""End-to-end local-first Persian OCR document pipeline orchestrator."""
+
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Sequence
+
+import psutil
+
+from config.settings import Settings, configure_cache_env, get_settings
+from src.ingestion.pdf_loader import load_document_pages
+from src.ingestion.preprocessor import preprocess_page
+from src.postprocess.normalizer import normalize_persian
+from src.postprocess.rtl_order import sort_blocks_rtl
+from src.postprocess.serializers import VALID_FORMATS, _cells_to_html_table, parse_formats
+from src.schemas.document import (
+    DocumentMetrics,
+    DocumentResult,
+    LayoutBlock,
+    PageMetrics,
+    PageResult,
+    RunMetadata,
+    StageTimings,
+    TableCell,
+    TextLine,
+)
+from src.storage.base import StorageBackend
+from src.storage.local import LocalStorageBackend
+from src.storage.outputs import OutputManager
+
+if TYPE_CHECKING:
+    from src.inference.engine import InferenceEngine
+
+logger = logging.getLogger(__name__)
+
+VALID_FORMATS_SET = set(VALID_FORMATS)
+
+
+class DocumentPipeline:
+    """Single-process sequential document OCR pipeline with pluggable storage."""
+
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        storage: StorageBackend | None = None,
+        engine: InferenceEngine | None = None,
+    ) -> None:
+        self.settings = settings or get_settings()
+        configure_cache_env(self.settings.models_dir)
+        self.storage: StorageBackend = storage or LocalStorageBackend(self.settings.data_dir)
+        self._engine = engine
+
+    @property
+    def engine(self) -> InferenceEngine:
+        """Lazily initialize InferenceEngine so non-inference tasks stay lightweight."""
+        if self._engine is None:
+            from src.inference.engine import InferenceEngine
+
+            self._engine = InferenceEngine(self.settings)
+        return self._engine
+
+    def unload(self) -> None:
+        """Release the underlying inference engine and clear GPU caches."""
+        if self._engine is not None and hasattr(self._engine, "unload"):
+            self._engine.unload()
+        self._engine = None
+
+    def _postprocess_page(self, page: PageResult) -> PageResult:
+        """Apply RTL block/line sorting and Persian Unicode normalization to a page."""
+        ordered_blocks = sort_blocks_rtl(page.blocks, page_width=page.width)
+        normalized_blocks: list[LayoutBlock] = []
+        policy = self.settings.digit_policy
+
+        for block in ordered_blocks:
+            norm_lines = [
+                line.model_copy(update={"text": normalize_persian(line.text, digit_policy=policy)})
+                for line in block.lines
+            ]
+            norm_cells = [
+                TableCell(
+                    **{
+                        **cell.model_dump(exclude={"text"}),
+                        "text": normalize_persian(cell.text, digit_policy=policy),
+                    }
+                )
+                for cell in block.cells
+            ]
+            if norm_lines:
+                block_text = "\n".join(ln.text for ln in norm_lines if ln.text)
+            else:
+                block_text = normalize_persian(block.text, digit_policy=policy)
+
+            updated_html = _cells_to_html_table(norm_cells) if norm_cells else block.html
+
+            normalized_blocks.append(
+                block.model_copy(
+                    update={
+                        "lines": norm_lines,
+                        "cells": norm_cells,
+                        "text": block_text,
+                        "html": updated_html,
+                    }
+                )
+            )
+
+        return page.model_copy(update={"blocks": normalized_blocks})
+
+    def _build_run_metadata(self, pages: list[PageResult]) -> RunMetadata:
+        """Build provenance metadata from active engine/recognizer or settings."""
+        eng = self._engine
+        recognizer = getattr(eng, "recognizer", None) if eng is not None else None
+
+        variant = self.settings.rec_model_variant
+        default_labels = {
+            "bina-0.2-rizehpizeh": "Bina-0.2-RizehPizeh",
+            "bina-0.2-rizeh": "Bina-0.2-Rizeh",
+            "bina-0.4-koochik": "Bina-0.4-Koochik",
+        }
+        rec_label = getattr(recognizer, "model_label", None) or default_labels.get(variant, variant)
+        granularity = getattr(
+            recognizer,
+            "granularity",
+            "region" if variant == "bina-0.4-koochik" else "line",
+        )
+        if pages and all(
+            len(p.blocks) == 1 and p.blocks[0].block_id.endswith("_native") for p in pages
+        ):
+            granularity = "native"
+
+        gpu_name = None
+        if eng is not None and hasattr(eng, "get_gpu_name"):
+            gpu_name = eng.get_gpu_name()
+        elif eng is not None and hasattr(eng, "health_info"):
+            gpu_name = eng.health_info().get("gpu_name")
+
+        det_model = self.settings.det_model_name if granularity == "line" else None
+        table_model = (
+            self.settings.table_model_name
+            if granularity in {"line", "region"} and self.settings.enable_tables
+            else None
+        )
+
+        return RunMetadata(
+            created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            rec_model_variant=variant,
+            rec_model_label=str(rec_label),
+            granularity=granularity,  # type: ignore[arg-type]
+            layout_model=self.settings.layout_model_name,
+            det_model=det_model,
+            table_model=table_model,
+            device=self.settings.device,
+            gpu_name=gpu_name,
+            dpi=self.settings.dpi,
+            digit_policy=self.settings.digit_policy,
+        )
+
+    @staticmethod
+    def _build_document_metrics(pages: list[PageResult], total_sec: float) -> DocumentMetrics:
+        """Aggregate page-level latency, memory peaks, stage timings, and content counts."""
+        latencies = [p.metrics.latency_sec for p in pages if p.metrics is not None]
+        vrams = [
+            p.metrics.peak_vram_mb
+            for p in pages
+            if p.metrics is not None and p.metrics.peak_vram_mb is not None
+        ]
+        rams = [
+            p.metrics.rss_ram_mb
+            for p in pages
+            if p.metrics is not None and p.metrics.rss_ram_mb is not None
+        ]
+
+        stage_totals = StageTimings(
+            preprocess_sec=round(
+                sum(p.metrics.stages.preprocess_sec for p in pages if p.metrics), 3
+            ),
+            layout_sec=round(sum(p.metrics.stages.layout_sec for p in pages if p.metrics), 3),
+            detect_sec=round(sum(p.metrics.stages.detect_sec for p in pages if p.metrics), 3),
+            table_sec=round(sum(p.metrics.stages.table_sec for p in pages if p.metrics), 3),
+            recognize_sec=round(sum(p.metrics.stages.recognize_sec for p in pages if p.metrics), 3),
+            postprocess_sec=round(
+                sum(p.metrics.stages.postprocess_sec for p in pages if p.metrics), 3
+            ),
+        )
+
+        total_blocks = sum(len(p.blocks) for p in pages)
+        total_lines = sum(sum(len(b.lines) for b in p.blocks) for p in pages)
+        total_tables = sum(sum(1 for b in p.blocks if b.type == "table") for p in pages)
+        total_chars = sum(sum(len(b.text) for b in p.blocks) for p in pages)
+
+        return DocumentMetrics(
+            total_sec=total_sec,
+            mean_page_latency_sec=round(sum(latencies) / len(latencies), 3) if latencies else 0.0,
+            peak_vram_mb=max(vrams) if vrams else None,
+            peak_rss_ram_mb=max(rams) if rams else None,
+            total_blocks=total_blocks,
+            total_lines=total_lines,
+            total_tables=total_tables,
+            total_chars=total_chars,
+            stage_totals=stage_totals,
+        )
+
+    def process_file(
+        self,
+        input_path: Path | str,
+        formats: str | Sequence[str] = ("json",),
+        output_prefix: str | None = None,
+        source_filename: str | None = None,
+        save_outputs: bool = True,
+        save_manifest: bool = True,
+    ) -> tuple[DocumentResult, dict[str, Path]]:
+        """Run end-to-end OCR on a PDF or image file and persist requested outputs."""
+        src_path = Path(input_path)
+        requested_formats = parse_formats(formats, default=("json",))
+        effective_name = source_filename or src_path.name
+
+        start_time = time.perf_counter()
+        pages: list[PageResult] = []
+        doc_id = uuid.uuid4().hex[:12]
+
+        for page_input in load_document_pages(src_path, dpi=self.settings.dpi):
+            if (
+                self.settings.use_native_pdf_text
+                and page_input.has_native_text
+                and page_input.native_text
+            ):
+                t_nat0 = time.perf_counter()
+                w, h = page_input.image.size
+                norm_text = normalize_persian(
+                    page_input.native_text,
+                    digit_policy=self.settings.digit_policy,
+                )
+                post_sec = round(time.perf_counter() - t_nat0, 3)
+                rss_mb = round(psutil.Process().memory_info().rss / (1024 * 1024), 2)
+                page_res = PageResult(
+                    page_number=page_input.page_number,
+                    width=w,
+                    height=h,
+                    blocks=[
+                        LayoutBlock(
+                            block_id=f"p{page_input.page_number}_native",
+                            type="text",
+                            bbox=(0.0, 0.0, float(w), float(h)),
+                            reading_order=0,
+                            text=norm_text,
+                            confidence=1.0,
+                            lines=[
+                                TextLine(
+                                    text=norm_text,
+                                    bbox=(0.0, 0.0, float(w), float(h)),
+                                    confidence=1.0,
+                                )
+                            ],
+                        )
+                    ],
+                    metrics=PageMetrics(
+                        latency_sec=post_sec,
+                        peak_vram_mb=None,
+                        rss_ram_mb=rss_mb,
+                        stages=StageTimings(postprocess_sec=post_sec),
+                        num_blocks=1,
+                        num_lines=1,
+                        num_tables=0,
+                        char_count=len(norm_text),
+                    ),
+                )
+            else:
+                t_pre0 = time.perf_counter()
+                bgr_img = preprocess_page(page_input.image, self.settings)
+                pre_sec = round(time.perf_counter() - t_pre0, 3)
+
+                try:
+                    raw_page = self.engine.process_page(page_input.page_number, bgr_img)
+                finally:
+                    del bgr_img
+
+                t_post0 = time.perf_counter()
+                page_res = self._postprocess_page(raw_page)
+                post_sec = round(time.perf_counter() - t_post0, 3)
+
+                if page_res.metrics is not None:
+                    updated_stages = page_res.metrics.stages.model_copy(
+                        update={
+                            "preprocess_sec": pre_sec,
+                            "postprocess_sec": post_sec,
+                        }
+                    )
+                    updated_metrics = page_res.metrics.model_copy(
+                        update={
+                            "stages": updated_stages,
+                            "num_blocks": len(page_res.blocks),
+                            "num_lines": sum(len(b.lines) for b in page_res.blocks),
+                            "num_tables": sum(1 for b in page_res.blocks if b.type == "table"),
+                            "char_count": sum(len(b.text) for b in page_res.blocks),
+                        }
+                    )
+                    page_res = page_res.model_copy(update={"metrics": updated_metrics})
+
+            pages.append(page_res)
+
+        total_sec = round(time.perf_counter() - start_time, 3)
+        metadata = self._build_run_metadata(pages)
+        doc_metrics = self._build_document_metrics(pages, total_sec=total_sec)
+        doc_result = DocumentResult(
+            doc_id=doc_id,
+            source_filename=effective_name,
+            page_count=len(pages),
+            pages=pages,
+            processing_time_sec=total_sec,
+            metadata=metadata,
+            metrics=doc_metrics,
+        )
+
+        written: dict[str, Path] = {}
+        if save_outputs and requested_formats:
+            out_mgr = OutputManager(self.storage)
+            written = out_mgr.save_outputs(
+                doc=doc_result,
+                formats=requested_formats,
+                model_variant=self.settings.rec_model_variant,
+                output_prefix=output_prefix,
+                save_manifest=save_manifest,
+            )
+
+        logger.info(
+            "Completed doc_id=%s file=%s model=%s pages=%d in %.2fs | "
+            "peak_vram=%s MB | peak_rss=%s MB | outputs=%s",
+            doc_id,
+            effective_name,
+            metadata.rec_model_variant,
+            len(pages),
+            total_sec,
+            f"{doc_metrics.peak_vram_mb:.1f}" if doc_metrics.peak_vram_mb is not None else "n/a",
+            f"{doc_metrics.peak_rss_ram_mb:.1f}" if doc_metrics.peak_rss_ram_mb is not None else "n/a",
+            {k: str(v) for k, v in written.items()},
+        )
+
+        return doc_result, written
