@@ -18,6 +18,7 @@ ALL_MODELS: tuple[RecognizerVariant, ...] = (
     "bina-0.2-rizehpizeh",
     "bina-0.2-rizeh",
     "bina-0.4-koochik",
+    "hybrid",
 )
 
 app = typer.Typer(help="Local-first Persian (RTL) OCR pipeline CLI.", no_args_is_help=True)
@@ -78,7 +79,7 @@ def run(
         "--model",
         "--rec-model",
         "-m",
-        help="Recognizer model: bina-0.2-rizehpizeh, bina-0.2-rizeh, bina-0.4-koochik, or all.",
+        help="Recognizer model: bina-0.2-rizehpizeh, bina-0.2-rizeh, bina-0.4-koochik, hybrid, or all.",
     ),
     batch_size: int | None = typer.Option(None, "--batch-size", help="Recognition batch size."),
     device: Literal["gpu", "cpu"] | None = typer.Option(None, "--device", help="Override device (gpu/cpu)."),

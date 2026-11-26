@@ -28,6 +28,7 @@ ALL_MODELS: tuple[RecognizerVariant, ...] = (
     "bina-0.2-rizehpizeh",
     "bina-0.2-rizeh",
     "bina-0.4-koochik",
+    "hybrid",
 )
 _MEDIA_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -167,22 +168,43 @@ def list_models() -> dict[str, Any]:
         if pipeline._engine is not None
         else set()
     )
+    ctc_label = (
+        "Bina-0.2-Rizeh"
+        if pipeline.settings.hybrid_ctc_variant == "bina-0.2-rizeh"
+        else "Bina-0.2-RizehPizeh"
+    )
+    vlm_label = (
+        f"OpenAI-VLM ({pipeline.settings.vlm_model_name or 'unconfigured'})"
+        if pipeline.settings.hybrid_vlm_variant == "openai-vlm"
+        else "Bina-0.4-Koochik"
+    )
     label_map = {
         "bina-0.2-rizehpizeh": "Bina-0.2-RizehPizeh",
         "bina-0.2-rizeh": "Bina-0.2-Rizeh",
         "bina-0.4-koochik": "Bina-0.4-Koochik",
+        "hybrid": f"Hybrid ({ctc_label} + {vlm_label})",
     }
     models = []
     for variant in ALL_MODELS:
         label = label_map[variant]
+        granularity = (
+            "hybrid"
+            if variant == "hybrid"
+            else ("region" if variant == "bina-0.4-koochik" else "line")
+        )
+        is_loaded = (
+            bool(loaded_labels) and pipeline.settings.rec_model_variant == "hybrid"
+            if variant == "hybrid"
+            else label in loaded_labels
+        )
         models.append(
             {
                 "variant": variant,
                 "label": label,
-                "granularity": "region" if variant == "bina-0.4-koochik" else "line",
+                "granularity": granularity,
                 "available_on_disk": check_model_available(variant, pipeline.settings),
                 "is_active": pipeline.settings.rec_model_variant == variant,
-                "is_loaded": label in loaded_labels,
+                "is_loaded": is_loaded,
             }
         )
     return {

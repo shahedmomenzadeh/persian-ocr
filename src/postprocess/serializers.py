@@ -405,6 +405,12 @@ def _render_html_run_banner(doc: DocumentResult) -> str:
         chips.append(
             f'<span><strong>خروجی:</strong> {dm.total_blocks} بلوک / {dm.total_lines} خط / {dm.total_tables} جدول</span>'
         )
+        if doc.metadata is not None and doc.metadata.granularity == "hybrid":
+            chips.append(
+                f'<span><strong>مسیر ترکیبی:</strong> <span dir="ltr">CTC={dm.total_ctc_blocks} '
+                f'({dm.stage_totals.ctc_sec:.2f}s) / VLM={dm.total_vlm_blocks} '
+                f'({dm.stage_totals.vlm_sec:.2f}s)</span></span>'
+            )
     else:
         chips.append(f'<span><strong>زمان کل:</strong> <span dir="ltr">{doc.processing_time_sec:.2f}s</span></span>')
 
@@ -440,6 +446,10 @@ def _render_page_meta_bar(page: PageResult) -> str:
     if pm.rss_ram_mb is not None:
         parts.append(f'RAM <span dir="ltr">{pm.rss_ram_mb:.1f} MB</span>')
     parts.append(f"{pm.num_blocks or len(page.blocks)} بلوک")
+    if pm.ctc_blocks > 0 and pm.vlm_blocks > 0:
+        parts.append(f'<span dir="ltr">CTC={pm.ctc_blocks} / VLM={pm.vlm_blocks}</span>')
+    elif pm.vlm_blocks > 0 and st.vlm_sec > 0 and st.ctc_sec > 0:
+        parts.append(f'<span dir="ltr">CTC={pm.ctc_blocks} / VLM={pm.vlm_blocks}</span>')
     if pm.corrections_count > 0:
         parts.append(f"{pm.corrections_count} اصلاح")
     return '    <div class="page-meta">' + " · ".join(parts) + "</div>\n"

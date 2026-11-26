@@ -147,3 +147,54 @@ def test_real_persian_kenlm_fixes_contextual_and_oov_errors() -> None:
     fixed3, corrs3 = checker.correct_text(clean, page_number=2, line_confidence=0.90)
     assert fixed3 == clean
     assert corrs3 == []
+
+    fixed4, corrs4 = checker.correct_text("ارزباب گمرک", page_number=7, line_confidence=0.80)
+    assert fixed4 == "ارزیاب گمرک"
+    assert any(c.original == "ارزباب" and c.corrected == "ارزیاب" for c in corrs4)
+
+    fixed5, corrs5 = checker.correct_text("نسبت به موارد ذیل معترض هستید", page_number=1, line_confidence=0.80)
+    assert fixed5 == "نسبت به موارد ذیل معترض هستید"
+    assert corrs5 == []
+
+
+def test_spellcheck_preserves_tanvin_and_fixes_adjacent_typo() -> None:
+    lexicon = PersianLexicon.build()
+    for mode in ("lexicon", "kenlm"):
+        if mode == "kenlm" and not Path("models/kenlm/persian_5gram_4bit.binary").is_file():
+            continue
+        checker = get_spellchecker(mode, kenlm_path="models/kenlm/persian_5gram_4bit.binary")
+        assert checker is not None
+
+        tanvin_line = "ضمناً اکیداً صرفاً لطفاً معمولاً"
+        fixed_clean, corrs_clean = checker.correct_text(tanvin_line, page_number=1, line_confidence=0.88)
+        assert fixed_clean == tanvin_line
+        assert corrs_clean == []
+
+        fixed_mixed, corrs_mixed = checker.correct_text("ضمناً گشور", page_number=1, line_confidence=0.88)
+        assert fixed_mixed == "ضمناً کشور"
+        assert [c.original for c in corrs_mixed] == ["گشور"]
+
+    assert lexicon.is_known("ضمناً")
+    assert lexicon.is_known("نمایندگان")
+
+
+def test_spellcheck_preserves_iranian_geography_domain_terms_and_morphology() -> None:
+    checker = get_spellchecker("lexicon")
+    assert checker is not None
+
+    clean_lines = [
+        "گمرک سومار و شهرستان خنداب و مرزن آباد",
+        "ارزیاب گمرک و مداد پاکن و پیجر",
+        "مهندسی صنایع دخانی و امتیاز حافظین قرآن",
+        "بندپایان و جوندگان و بیماری‌های منتقله",
+        "مراجعین و ناظرین و نمایندگان",
+    ]
+    for line in clean_lines:
+        fixed, corrs = checker.correct_text(line, page_number=1)
+        assert fixed == line
+        assert corrs == []
+
+    fixed_err, corrs_err = checker.correct_text("ارزباب گمرک", page_number=7)
+    assert fixed_err == "ارزیاب گمرک"
+    assert len(corrs_err) == 1
+    assert corrs_err[0].corrected == "ارزیاب"

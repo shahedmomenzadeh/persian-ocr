@@ -44,6 +44,8 @@ class LayoutBlock(BaseModel):
     cells: list[TableCell] = Field(default_factory=list)
     confidence: float = 0.0
     lines: list[TextLine] = Field(default_factory=list)
+    recognizer: str | None = None
+    routing_reason: str | None = None
 
 
 class StageTimings(BaseModel):
@@ -54,6 +56,8 @@ class StageTimings(BaseModel):
     detect_sec: float = 0.0
     table_sec: float = 0.0
     recognize_sec: float = 0.0
+    ctc_sec: float = 0.0
+    vlm_sec: float = 0.0
     postprocess_sec: float = 0.0
     spellcheck_sec: float = 0.0
 
@@ -80,6 +84,8 @@ class PageMetrics(BaseModel):
     num_tables: int = 0
     char_count: int = 0
     corrections_count: int = 0
+    ctc_blocks: int = 0
+    vlm_blocks: int = 0
 
 
 class PageResult(BaseModel):
@@ -98,7 +104,7 @@ class RunMetadata(BaseModel):
     created_at: str
     rec_model_variant: str
     rec_model_label: str
-    granularity: Literal["line", "region", "native"] = "line"
+    granularity: Literal["line", "region", "hybrid", "native"] = "line"
     layout_model: str
     det_model: str | None = None
     table_model: str | None = None
@@ -122,6 +128,8 @@ class DocumentMetrics(BaseModel):
     total_tables: int = 0
     total_chars: int = 0
     total_corrections: int = 0
+    total_ctc_blocks: int = 0
+    total_vlm_blocks: int = 0
     corrections: list[SpellcheckCorrection] = Field(default_factory=list)
     stage_totals: StageTimings = Field(default_factory=StageTimings)
 

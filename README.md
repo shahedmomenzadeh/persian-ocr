@@ -1,6 +1,6 @@
 # Persian OCR Pipeline
 
-Local-first, single-GPU (6 GB VRAM–safe) modular **Persian (RTL) document OCR pipeline** for scanned PDFs and images. Combines PaddleOCR layout & table structure analysis with pluggable Persian recognizers (`Bina-0.2-RizehPizeh`, `Bina-0.2-Rizeh`, `Bina-0.4-Koochik`), RTL reading-order reconstruction, Persian Unicode/ZWNJ normalization, 2-phase OCR spellchecking (`lexicon` + optional `kenlm` 5-gram rescoring), and structured HTML/Markdown/TXT/JSON outputs with full per-stage observability.
+Local-first, single-GPU (6 GB VRAM–safe) modular **Persian (RTL) document OCR pipeline** for scanned PDFs and images. Combines PaddleOCR layout & table structure analysis with pluggable Persian recognizers (`Bina-0.2-Rizeh`, `Bina-0.2-RizehPizeh`, `Bina-0.4-Koochik`, and `hybrid` CTC + VLM escalation), batched cell/footer ink recovery, RTL reading-order reconstruction, Persian Unicode/ZWNJ normalization, 2-phase OCR spellchecking (`lexicon` + `kenlm` 5-gram rescoring), and structured HTML/Markdown/TXT/JSON outputs with full per-stage observability.
 
 ---
 
@@ -9,9 +9,10 @@ Local-first, single-GPU (6 GB VRAM–safe) modular **Persian (RTL) document OCR 
 - **Lazy 1-page-at-a-time ingestion** (`pypdfium2` + Pillow) to bound host RAM on large PDFs, plus multi-frame TIFF and EXIF-transposed image support.
 - **Persian-safe preprocessing**: gentle Hough-line deskew (`[-15°, +15°]`), optional denoising, and dot-preserving LAB-channel CLAHE contrast normalization.
 - **Layout & RTL table reconstruction**: `PP-DocLayout_plus-L` region detection + `SLANet_plus` cell-grid parsing with automatic RTL column reversal and `rowspan`/`colspan` HTML/Markdown tables.
-- **Pluggable recognizers**:
-  - **Line-level CTC** (`Bina-0.2-RizehPizeh`, `Bina-0.2-Rizeh`) paired with `PP-OCRv6_medium_det`, dot-safe padding, RTL wide-line splitting, and width bucketing.
-  - **Region-level VLM** (`Bina-0.4-Koochik` / Nemotron-3.5-Parse) paired with `SLANet_plus` cell-grid segmentation and ink-filtered cell OCR.
+- **Pluggable & Hybrid recognizers**:
+  - **Line-level CTC (`bina-0.2-rizeh`, default / `bina-0.2-rizehpizeh`)** paired with `PP-OCRv6_medium_det`, native full-width recognition (`max_wh_ratio=42.0`), width bucketing, and batched `SLANet_plus` empty-cell/footer ink recovery.
+  - **Region-level VLM (`bina-0.4-koochik`)** paired with `SLANet_plus` border-trimmed, ink-filtered cell OCR.
+  - **Smart Hybrid (`hybrid`)**: Runs fast CTC + cell-ink recovery by default (`~510 MB` VRAM speed on prose & tall tables), routes compact tables (`<=8` rows / `<=550px`) and low-confidence/complex blocks to a guarded VLM (`Bina-0.4-Koochik` locally, or an optional OpenAI-compatible VLM endpoint via `VLM_API_BASE_URL`), and automatically rejects synthetic HTML/CSS boilerplate back to CTC.
 - **RTL reading-order sorting & Persian normalization**: band-aware right-to-left column sorting, NFC normalization, Arabic-to-Persian letter unification (`ي/ى→ی`, `ك→ک`, `ة→ه`, `ۀ→هٔ`), ZWNJ hygiene, and digit policy (`persian`, `latin`, `preserve`) that protects URLs, emails, and version numbers.
 - **2-Phase Persian OCR spellchecker**:
   - **Phase 1 (`lexicon`)**: Persian visual-confusion weighted Damerau-Levenshtein + SymSpell 1-delete index (`wordfreq` + Iranian geography/admin lexicon), ZWNJ compound insertion, and adjacent split-word merging.
@@ -25,10 +26,11 @@ Local-first, single-GPU (6 GB VRAM–safe) modular **Persian (RTL) document OCR 
 
 | Model Key (`--model`) | Hugging Face Repo | Role / Granularity | Local Directory |
 | --- | --- | --- | --- |
-| `bina-0.2-rizehpizeh` *(default)* | `Reza2kn/Bina-0.2-RizehPizeh` | Paddle CTC line recognizer | `models/bina-0.2/` |
-| `bina-0.2-rizeh` | `Reza2kn/Bina-0.2-Rizeh` | Paddle CTC line recognizer | `models/bina-0.2-rizeh/` |
+| `bina-0.2-rizeh` *(default)* | `Reza2kn/Bina-0.2-Rizeh` | Paddle CTC line recognizer + cell-ink recovery | `models/bina-0.2-rizeh/` |
+| `bina-0.2-rizehpizeh` | `Reza2kn/Bina-0.2-RizehPizeh` | Lightweight Paddle CTC line recognizer | `models/bina-0.2/` |
 | `bina-0.4-koochik` | `Reza2kn/Bina-0.4-Koochik` | Transformers (`Nemotron-3.5-Parse`) region VLM | `models/bina-0.4-koochik/` |
-| `persian-kenlm` *(optional)* | `PouyaZX4/persian-5gram-kenlm` | 4-bit quantized 5-gram Persian KenLM (`persian_5gram_4bit.binary`) | `models/kenlm/` |
+| `hybrid` | `Rizeh` + `Koochik` *(or OpenAI-VLM)* | CTC primary + guarded VLM escalation | Uses `models/` or `VLM_API_BASE_URL` |
+| `persian-kenlm` *(default spellcheck)* | `PouyaZX4/persian-5gram-kenlm` | 4-bit quantized 5-gram Persian KenLM (`persian_5gram_4bit.binary`) | `models/kenlm/` |
 
 PaddleOCR layout, text detection, and table structure models (`PP-DocLayout_plus-L`, `PP-OCRv6_medium_det`, `SLANet_plus`) are cached automatically under `models/cache/paddlex/` on first use.
 
@@ -43,12 +45,13 @@ PDF / Image
 [1-Page Lazy Rasterization] ─▶ [Deskew + Mild LAB CLAHE]
    │
    ▼  src/inference/layout.py & engine.py
-[PP-DocLayout_plus-L]
-   ├── Line Mode (Bina-0.2-*): PP-OCRv6_medium_det + SLANet_plus ─▶ Batched Line CTC
-   └── Region Mode (Bina-0.4-Koochik): SLANet_plus cell crops (ink-filtered) + Region VLM
+[PP-DocLayout_plus-L + SLANet_plus]
+   ├── Line Mode (bina-0.2-*, default): PP-OCRv6_medium_det + Empty Cell/Footer Ink Crops ─▶ Batched CTC (max_wh=42)
+   ├── Hybrid Mode (hybrid): CTC Primary ─▶ Guarded VLM (Compact Tables <=8 rows, Low-Conf, Multicolumn, or OpenAI-VLM)
+   └── Region Mode (bina-0.4-koochik): Border-Trimmed SLANet_plus Cells + Region VLM
    │
    ▼  src/postprocess/ (rtl_order.py, normalizer.py, spellcheck.py)
-[RTL Column/Line Sort] ─▶ [Persian NFC + ZWNJ + Digit Policy] ─▶ [Spellcheck: off | lexicon | kenlm]
+[RTL Column/Line Sort] ─▶ [Persian NFC + ZWNJ + Digit Policy] ─▶ [Spellcheck: kenlm (default) | lexicon | off]
    │
    ▼  src/postprocess/serializers.py & src/storage/outputs.py
 <out_dir>/<doc_stem>/<model_variant>/<doc_stem>__<model_variant>.{html,md,txt,json} + manifest.json
@@ -185,10 +188,10 @@ python -m src.cli run ./my_scans/ \
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `--model`, `--rec-model`, `-m` | `bina-0.2-rizehpizeh`, `bina-0.2-rizeh`, `bina-0.4-koochik`, or `all` | `Settings.rec_model_variant` |
+| `--model`, `--rec-model`, `-m` | `bina-0.2-rizeh`, `bina-0.2-rizehpizeh`, `bina-0.4-koochik`, `hybrid`, or `all` | `Settings.rec_model_variant` (`bina-0.2-rizeh`) |
 | `--out-format`, `--formats`, `-f` | Repeatable, comma-separated, or space-separated: `html`, `md`, `txt`, `json` | `json,md,html` |
 | `--output-dir`, `-o` | Root directory for structured outputs | `./out` |
-| `--spellcheck` | `off`, `lexicon`, or `kenlm` | `Settings.spellcheck_mode` (`lexicon`) |
+| `--spellcheck` | `off`, `lexicon`, or `kenlm` | `Settings.spellcheck_mode` (`kenlm`) |
 | `--device` | `gpu` or `cpu` | `Settings.device` (`gpu`) |
 | `--dpi` | PDF rasterization DPI | `200` |
 | `--batch-size` | CTC line recognition batch size | `4` |
@@ -267,17 +270,41 @@ Each output embeds provenance and performance telemetry:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `DEVICE` | `gpu` | `gpu` or `cpu` |
-| `REC_MODEL_VARIANT` | `bina-0.2-rizehpizeh` | `bina-0.2-rizehpizeh`, `bina-0.2-rizeh`, or `bina-0.4-koochik` |
+| `REC_MODEL_VARIANT` | `bina-0.2-rizeh` | `bina-0.2-rizeh`, `bina-0.2-rizehpizeh`, `bina-0.4-koochik`, or `hybrid` |
 | `DPI` | `200` | PDF rasterization DPI |
 | `DET_MAX_SIDE_LEN` | `1280` | Max image side length for `PP-OCRv6_medium_det` |
 | `REC_BATCH_SIZE` | `4` | Batch size for Bina-0.2 line recognition |
+| `REC_MAX_WH_RATIO` | `42.0` | Aspect-ratio threshold before splitting ultra-wide lines at whitespace |
+| `REC_TARGET_CHUNK_RATIO` | `32.0` | Target chunk ratio when an ultra-wide line must split |
+| `ENABLE_CELL_INK_RECOVERY` | `true` | Batch-recognize inked `SLANet_plus` cells/footers missed by text detection |
 | `ENABLE_TABLES` | `true` | Enable `SLANet_plus` table structure recognition |
+| `HYBRID_CTC_VARIANT` | `bina-0.2-rizeh` | Primary CTC backend for `hybrid` mode |
+| `HYBRID_VLM_VARIANT` | `bina-0.4-koochik` | `bina-0.4-koochik` (local) or `openai-vlm` (external HTTP vision API) |
+| `HYBRID_VLM_MAX_TABLE_ROWS` | `8` | Max table rows sent whole-table to local `bina-0.4-koochik` |
+| `HYBRID_VLM_MAX_TABLE_HEIGHT_PX` | `550` | Max table crop height (px) for local whole-table VLM |
+| `HYBRID_CTC_CONF_THRESHOLD` | `0.88` | Mean CTC block confidence below which `hybrid` escalates to VLM |
+| `VLM_API_BASE_URL` | `None` | OpenAI-compatible base URL (e.g. `http://localhost:11434/v1`) when using `openai-vlm` |
+| `VLM_API_KEY` | `None` | Optional Bearer token for OpenAI-compatible VLM endpoint |
+| `VLM_MODEL_NAME` | `None` | Vision model ID (e.g. `qwen2.5vl:7b`) when using `openai-vlm` |
 | `CLEAR_CUDA_CACHE_PER_PAGE` | `true` | Empty Paddle/PyTorch CUDA caches after each page |
 | `DIGIT_POLICY` | `persian` | `persian`, `latin`, or `preserve` |
-| `SPELLCHECK_MODE` | `lexicon` | `off`, `lexicon` (Phase 1), or `kenlm` (Phase 2) |
+| `SPELLCHECK_MODE` | `kenlm` | `off`, `lexicon` (Phase 1), or `kenlm` (Phase 2) |
 | `SPELLCHECK_KENLM_PATH` | `./models/kenlm/persian_5gram_4bit.binary` | Path to KenLM binary for `kenlm` mode |
 | `SPELLCHECK_REAL_WORD_CONF_THRESHOLD` | `0.94` | Line confidence below which KenLM considers real-word visual swaps |
 | `SPELLCHECK_CUSTOM_DICT` | `None` | Optional custom vocabulary file (`word` or `word<tab>freq` per line) |
+
+### Using an External Whole-Table VLM (Optional)
+
+In `.env`, point `hybrid` to any OpenAI-compatible vision server (Ollama, vLLM, OpenRouter, Gemini, OpenAI) without installing extra Python packages:
+
+```env
+REC_MODEL_VARIANT=hybrid
+HYBRID_VLM_VARIANT=openai-vlm
+VLM_API_BASE_URL=http://localhost:11434/v1
+VLM_MODEL_NAME=qwen2.5vl:7b
+```
+
+Whole-table Markdown responses are automatically converted to RTL HTML and validated against HTML/CSS boilerplate—falling back to Enhanced CTC + Cell-Ink Recovery if the endpoint is unreachable or returns malformed markup.
 
 ---
 
@@ -296,6 +323,13 @@ Measured results on **NVIDIA GeForce RTX 4060 Laptop GPU (8 GB VRAM)**, 50 rando
 | **Bina-0.2-RizehPizeh** | 71.45 | **66.49** | **1.089** | **0.850** | **1.999** | **45.1** | **505.4 MB** | **1556.0 MB** | 2713.9 MB |
 | **Bina-0.2-Rizeh** | **65.41** | 98.85 | 1.738 | 1.463 | 3.348 | 30.4 | 507.3 MB | **1556.0 MB** | **2454.8 MB** |
 | **Bina-0.4-Koochik** | 140.80 | 626.36 | 12.222 | 11.968 | 21.464 | 4.8 | 1785.3 MB | 2980.0 MB | 3499.6 MB |
+
+5-page mixed prose + dense table comparison (`data/test_5page.pdf`, `--spellcheck kenlm` on RTX 4060):
+
+| Mode | Total (s) | P2–P3 Text (s) | P4–P5 Tables (s) | Peak FW VRAM | Notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| **Enhanced `bina-0.2-rizeh`** *(default)* | **89.05** | **0.65 / 0.17** | **5.88 / 4.70** | **472.0 MB** | Native full-width lines (`max_wh=42`), batched cell/footer ink recovery |
+| **Smart `hybrid`** | 121.84 | 0.65 / 0.22 | 7.99 / 4.83 | 2026.5 MB | Clean compact whole-table VLM (`p4_b1` in `3.0s`), recovers all footers (`۱–۴`) & tall tables via CTC |
 
 ---
 

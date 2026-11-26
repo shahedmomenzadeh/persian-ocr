@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import importlib.util
+import json
 import logging
 import math
+import re
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -113,8 +118,8 @@ def _find_whitespace_split(
 
 def _split_wide_line(
     crop: np.ndarray,
-    max_wh_ratio: float = 14.0,
-    target_chunk_ratio: float = 12.0,
+    max_wh_ratio: float = 42.0,
+    target_chunk_ratio: float = 32.0,
 ) -> list[np.ndarray]:
     """Split wide line crops at internal whitespace valleys in RTL (right-to-left) order."""
     h, w = crop.shape[:2]
@@ -127,7 +132,7 @@ def _split_wide_line(
     ink_density = (gray < ink_thresh).mean(axis=0)
     col_bright = gray.mean(axis=0)
 
-    margin = max(8, int(round(w * 0.08)))
+    margin = max(16, int(round(w * 0.18)))
     split_points: list[int] = [0]
     for k in range(1, n_parts):
         ideal_x = int(round(k * w / n_parts))
@@ -211,7 +216,12 @@ def _bucket_by_resized_width(
 
 def _resolve_bina_paddle_dir(settings: Settings) -> tuple[Path, str]:
     """Return (model_dir, human_label) for Paddle-based Bina-0.2 variants."""
-    if settings.rec_model_variant == "bina-0.2-rizeh":
+    effective_variant = (
+        settings.hybrid_ctc_variant
+        if settings.rec_model_variant == "hybrid"
+        else settings.rec_model_variant
+    )
+    if effective_variant == "bina-0.2-rizeh":
         return Path(settings.bina_rizeh_model_dir).resolve(), "Bina-0.2-Rizeh"
     return Path(settings.bina_model_dir).resolve(), "Bina-0.2-RizehPizeh"
 
@@ -225,17 +235,22 @@ class BinaRecognizer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         configure_cache_env(settings.models_dir)
+        effective_variant = (
+            settings.hybrid_ctc_variant
+            if settings.rec_model_variant == "hybrid"
+            else settings.rec_model_variant
+        )
         bina_dir, label = _resolve_bina_paddle_dir(settings)
         self.model_label = label
         weights_dir = bina_dir / "inference"
         if not weights_dir.is_dir():
             raise FileNotFoundError(
                 f"{label} inference weights not found at {weights_dir}. "
-                f"Run `python scripts/download_models.py --model {settings.rec_model_variant}` first."
+                f"Run `python scripts/download_models.py --model {effective_variant}` first."
             )
 
         bina_mod = _load_module_from_path(
-            f"bina_text_recognition_{settings.rec_model_variant.replace('-', '_')}",
+            f"bina_text_recognition_{effective_variant.replace('-', '_')}",
             bina_dir / "bina_text_recognition.py",
         )
         paddle_dev = to_paddle_device(settings.device)
@@ -501,8 +516,150 @@ class BinaNemotronRecognizer:
         return [self.recognize_region(crop, block_type="text") for crop in crops]
 
 
+_CODE_FENCE_RE = re.compile(r"^```(?:markdown|md|html|text)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
+
+
+class OpenAIVLMRecognizer:
+    """Optional OpenAI-compatible HTTP vision recognizer (Ollama, vLLM, OpenRouter, Gemini, OpenAI)."""
+
+    granularity: Literal["line", "region"] = "region"
+    _instances: dict[tuple[str, str, str], "OpenAIVLMRecognizer"] = {}
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        if not settings.vlm_api_base_url or not settings.vlm_model_name:
+            raise ValueError(
+                "hybrid_vlm_variant='openai-vlm' requires both vlm_api_base_url and vlm_model_name."
+            )
+        self.base_url = settings.vlm_api_base_url.rstrip("/")
+        self.api_key = settings.vlm_api_key or ""
+        self.model_name = settings.vlm_model_name
+        self.timeout_sec = float(settings.vlm_timeout_sec)
+        self.model_label = f"OpenAI-VLM ({self.model_name})"
+        logger.info("Configured %s via %s", self.model_label, self.base_url)
+
+    @classmethod
+    def get_instance(cls, settings: Settings) -> "OpenAIVLMRecognizer":
+        key = (
+            (settings.vlm_api_base_url or "").rstrip("/"),
+            settings.vlm_model_name or "",
+            settings.vlm_api_key or "",
+        )
+        if key not in cls._instances:
+            cls._instances[key] = cls(settings)
+        return cls._instances[key]
+
+    @classmethod
+    def clear_cache(cls) -> None:
+        cls._instances.clear()
+
+    @staticmethod
+    def _build_prompt(block_type: str) -> str:
+        if block_type == "table":
+            return (
+                "Transcribe this Persian table accurately into a single clean Markdown pipe table "
+                "(| col1 | col2 |). Preserve all Persian text, ZWNJ, and numbers exactly in "
+                "RTL logical column order. Output ONLY the Markdown table with no HTML, CSS, or explanation."
+            )
+        return (
+            "Transcribe all Persian and English text and numbers in this document image accurately "
+            "line by line, preserving ZWNJ and punctuation. Output ONLY the transcribed text."
+        )
+
+    @staticmethod
+    def _strip_code_fence(text: str) -> str:
+        stripped = text.strip()
+        match = _CODE_FENCE_RE.match(stripped)
+        if match:
+            return match.group(1).strip()
+        return stripped
+
+    def recognize_region(
+        self,
+        crop: np.ndarray,
+        block_type: str = "text",
+        max_new_tokens: int | None = None,
+    ) -> tuple[str, float]:
+        if (
+            crop is None
+            or crop.size == 0
+            or crop.ndim != 3
+            or crop.shape[0] < 4
+            or crop.shape[1] < 4
+        ):
+            return ("", 0.0)
+
+        ok, encoded = cv2.imencode(".png", crop)
+        if not ok:
+            return ("", 0.0)
+        b64_png = base64.b64encode(encoded.tobytes()).decode("ascii")
+        data_uri = f"data:image/png;base64,{b64_png}"
+
+        payload = {
+            "model": self.model_name,
+            "temperature": 0.0,
+            "max_tokens": max_new_tokens or 2048,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": self._build_prompt(block_type)},
+                        {"type": "image_url", "image_url": {"url": data_uri}},
+                    ],
+                }
+            ],
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        req = urllib.request.Request(
+            url=f"{self.base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
+                raw_body = resp.read().decode("utf-8", errors="replace")
+            parsed = json.loads(raw_body)
+            content = (
+                parsed.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            if isinstance(content, list):
+                content = "".join(
+                    str(part.get("text", ""))
+                    for part in content
+                    if isinstance(part, dict)
+                )
+            text = self._strip_code_fence(str(content or ""))
+            if not text:
+                return ("", 0.0)
+            return (text, 0.95)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
+            logger.warning("OpenAIVLMRecognizer request failed (%s); falling back to CTC.", exc)
+            return ("", 0.0)
+
+    def recognize_batch(
+        self,
+        crops: list[np.ndarray],
+        batch_size: int | None = None,
+    ) -> list[tuple[str, float]]:
+        del batch_size
+        return [self.recognize_region(crop, block_type="text") for crop in crops]
+
+
 def check_model_available(variant: RecognizerVariant, settings: Settings) -> bool:
     """Return True if the recognizer weights required for variant exist on disk."""
+    if variant == "hybrid":
+        ctc_ok = check_model_available(settings.hybrid_ctc_variant, settings)
+        if settings.hybrid_vlm_variant == "openai-vlm":
+            vlm_ok = bool(settings.vlm_api_base_url and settings.vlm_model_name)
+        else:
+            vlm_ok = check_model_available(settings.hybrid_vlm_variant, settings)
+        return ctc_ok and vlm_ok
     if variant == "bina-0.2-rizehpizeh":
         base = Path(settings.bina_model_dir)
         return (base / "bina_text_recognition.py").is_file() and (
@@ -520,10 +677,19 @@ def check_model_available(variant: RecognizerVariant, settings: Settings) -> boo
 
 
 def create_recognizer(settings: Settings) -> TextRecognizerProtocol:
-    """Factory returning the configured recognizer backend for settings.rec_model_variant."""
+    """Factory returning the primary recognizer backend for settings.rec_model_variant."""
     variant: RecognizerVariant = settings.rec_model_variant
-    if variant in {"bina-0.2-rizehpizeh", "bina-0.2-rizeh"}:
+    if variant in {"bina-0.2-rizehpizeh", "bina-0.2-rizeh", "hybrid"}:
         return BinaRecognizer.get_instance(settings)
     if variant == "bina-0.4-koochik":
         return BinaNemotronRecognizer.get_instance(settings)
     raise ValueError(f"Unsupported rec_model_variant: {variant!r}")
+
+
+def create_vlm_recognizer(settings: Settings) -> TextRecognizerProtocol:
+    """Factory returning the VLM region recognizer used in hybrid mode."""
+    if settings.hybrid_vlm_variant == "bina-0.4-koochik":
+        return BinaNemotronRecognizer.get_instance(settings)
+    if settings.hybrid_vlm_variant == "openai-vlm":
+        return OpenAIVLMRecognizer.get_instance(settings)
+    raise ValueError(f"Unsupported hybrid_vlm_variant: {settings.hybrid_vlm_variant!r}")

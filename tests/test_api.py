@@ -22,6 +22,7 @@ class _StubEngine:
             "bina-0.2-rizehpizeh": "Bina-0.2-RizehPizeh",
             "bina-0.2-rizeh": "Bina-0.2-Rizeh",
             "bina-0.4-koochik": "Bina-0.4-Koochik",
+            "hybrid": "Hybrid (Bina-0.2-Rizeh + Bina-0.4-Koochik)",
         }
         self.model_label = labels.get(variant, variant)
 
@@ -80,7 +81,12 @@ def _make_png_bytes() -> bytes:
 
 
 def test_health_and_ocr_endpoints(tmp_path: Path, monkeypatch) -> None:
-    settings = Settings(data_dir=tmp_path, models_dir=tmp_path / "models", device="cpu")
+    settings = Settings(
+        data_dir=tmp_path,
+        models_dir=tmp_path / "models",
+        device="cpu",
+        rec_model_variant="bina-0.2-rizehpizeh",
+    )
     stub_pipeline = DocumentPipeline(
         settings=settings,
         storage=LocalStorageBackend(tmp_path / "out"),
@@ -129,7 +135,9 @@ def test_api_model_selection_config_and_output_serving(tmp_path: Path, monkeypat
     with TestClient(api_mod.app) as client:
         models_resp = client.get("/models")
         assert models_resp.status_code == 200
-        assert len(models_resp.json()["models"]) == 3
+        models_list = models_resp.json()["models"]
+        assert len(models_list) == 4
+        assert any(m["variant"] == "hybrid" and m["granularity"] == "hybrid" for m in models_list)
 
         cfg_resp = client.post(
             "/config",
@@ -163,3 +171,12 @@ def test_api_model_selection_config_and_output_serving(tmp_path: Path, monkeypat
         assert dl_resp.status_code == 200
         assert "text/html" in dl_resp.headers["content-type"]
         assert "bina-0.4-koochik" in dl_resp.text
+
+        hyb_resp = client.post(
+            "/ocr?model=hybrid&out_format=html&out_format=json",
+            files={"file": ("hyb_doc.png", _make_png_bytes(), "image/png")},
+        )
+        assert hyb_resp.status_code == 200
+        hyb_data = hyb_resp.json()
+        assert hyb_data["model"] == "hybrid"
+        assert hyb_data["observability"]["metadata"]["granularity"] == "hybrid"

@@ -9,7 +9,12 @@ from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-RecognizerVariant = Literal["bina-0.2-rizehpizeh", "bina-0.2-rizeh", "bina-0.4-koochik"]
+RecognizerVariant = Literal[
+    "bina-0.2-rizehpizeh",
+    "bina-0.2-rizeh",
+    "bina-0.4-koochik",
+    "hybrid",
+]
 SpellcheckMode = Literal["off", "lexicon", "kenlm"]
 
 
@@ -40,16 +45,32 @@ class Settings(BaseSettings):
     # VRAM & inference limits
     device: Literal["gpu", "cpu"] = "gpu"
     det_max_side_len: int = 1280
-    rec_model_variant: RecognizerVariant = "bina-0.2-rizehpizeh"
+    rec_model_variant: RecognizerVariant = "bina-0.2-rizeh"
     rec_batch_size: int = 4
-    rec_max_wh_ratio: float = 14.0
-    rec_target_chunk_ratio: float = 12.0
+    rec_max_wh_ratio: float = 42.0
+    rec_target_chunk_ratio: float = 32.0
+    enable_cell_ink_recovery: bool = True
     nemotron_max_new_tokens: int = 1024
     enable_tables: bool = True
     use_formula_recognition: bool = False
     use_chart_recognition: bool = False
     use_seal_recognition: bool = False
     clear_cuda_cache_per_page: bool = True
+
+    # Hybrid routing (CTC primary + guarded VLM escalation)
+    hybrid_ctc_variant: Literal["bina-0.2-rizeh", "bina-0.2-rizehpizeh"] = "bina-0.2-rizeh"
+    hybrid_vlm_variant: Literal["bina-0.4-koochik", "openai-vlm"] = "bina-0.4-koochik"
+    hybrid_route_tables: bool = True
+    hybrid_vlm_max_table_rows: int = 8
+    hybrid_vlm_max_table_height_px: int = 550
+    hybrid_route_complex: bool = True
+    hybrid_ctc_conf_threshold: float = 0.88
+
+    # Optional OpenAI-compatible VLM endpoint (Ollama, vLLM, Gemini, OpenRouter, OpenAI)
+    vlm_api_base_url: str | None = None
+    vlm_api_key: str | None = None
+    vlm_model_name: str | None = None
+    vlm_timeout_sec: float = 60.0
 
     # Model identifiers
     layout_model_name: str = "PP-DocLayout_plus-L"
@@ -58,7 +79,7 @@ class Settings(BaseSettings):
 
     # Persian post-processing
     digit_policy: Literal["persian", "latin", "preserve"] = "persian"
-    spellcheck_mode: SpellcheckMode = "lexicon"
+    spellcheck_mode: SpellcheckMode = "kenlm"
     spellcheck_custom_dict: Path | None = None
     spellcheck_kenlm_path: Path | None = Path("./models/kenlm/persian_5gram_4bit.binary")
     spellcheck_real_word_conf_threshold: float = 0.94

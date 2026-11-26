@@ -178,17 +178,32 @@ class DocumentPipeline:
         recognizer = getattr(eng, "recognizer", None) if eng is not None else None
 
         variant = self.settings.rec_model_variant
+        ctc_label = (
+            "Bina-0.2-Rizeh"
+            if self.settings.hybrid_ctc_variant == "bina-0.2-rizeh"
+            else "Bina-0.2-RizehPizeh"
+        )
+        vlm_label = (
+            f"OpenAI-VLM ({self.settings.vlm_model_name or 'unconfigured'})"
+            if self.settings.hybrid_vlm_variant == "openai-vlm"
+            else "Bina-0.4-Koochik"
+        )
         default_labels = {
             "bina-0.2-rizehpizeh": "Bina-0.2-RizehPizeh",
             "bina-0.2-rizeh": "Bina-0.2-Rizeh",
             "bina-0.4-koochik": "Bina-0.4-Koochik",
+            "hybrid": f"Hybrid ({ctc_label} + {vlm_label})",
         }
-        rec_label = getattr(recognizer, "model_label", None) or default_labels.get(variant, variant)
-        granularity = getattr(
-            recognizer,
-            "granularity",
-            "region" if variant == "bina-0.4-koochik" else "line",
-        )
+        if variant == "hybrid":
+            rec_label = default_labels["hybrid"]
+            granularity = "hybrid"
+        else:
+            rec_label = getattr(recognizer, "model_label", None) or default_labels.get(variant, variant)
+            granularity = getattr(
+                recognizer,
+                "granularity",
+                "region" if variant == "bina-0.4-koochik" else "line",
+            )
         if pages and all(
             len(p.blocks) == 1 and p.blocks[0].block_id.endswith("_native") for p in pages
         ):
@@ -200,10 +215,10 @@ class DocumentPipeline:
         elif eng is not None and hasattr(eng, "health_info"):
             gpu_name = eng.health_info().get("gpu_name")
 
-        det_model = self.settings.det_model_name if granularity == "line" else None
+        det_model = self.settings.det_model_name if granularity in {"line", "hybrid"} else None
         table_model = (
             self.settings.table_model_name
-            if granularity in {"line", "region"} and self.settings.enable_tables
+            if granularity in {"line", "region", "hybrid"} and self.settings.enable_tables
             else None
         )
 
@@ -249,6 +264,8 @@ class DocumentPipeline:
             detect_sec=round(sum(p.metrics.stages.detect_sec for p in pages if p.metrics), 3),
             table_sec=round(sum(p.metrics.stages.table_sec for p in pages if p.metrics), 3),
             recognize_sec=round(sum(p.metrics.stages.recognize_sec for p in pages if p.metrics), 3),
+            ctc_sec=round(sum(p.metrics.stages.ctc_sec for p in pages if p.metrics), 3),
+            vlm_sec=round(sum(p.metrics.stages.vlm_sec for p in pages if p.metrics), 3),
             postprocess_sec=round(
                 sum(p.metrics.stages.postprocess_sec for p in pages if p.metrics), 3
             ),
@@ -261,6 +278,8 @@ class DocumentPipeline:
         total_lines = sum(sum(len(b.lines) for b in p.blocks) for p in pages)
         total_tables = sum(sum(1 for b in p.blocks if b.type == "table") for p in pages)
         total_chars = sum(sum(len(b.text) for b in p.blocks) for p in pages)
+        total_ctc_blocks = sum(p.metrics.ctc_blocks for p in pages if p.metrics)
+        total_vlm_blocks = sum(p.metrics.vlm_blocks for p in pages if p.metrics)
         all_corrs = corrections or []
 
         return DocumentMetrics(
@@ -273,6 +292,8 @@ class DocumentPipeline:
             total_tables=total_tables,
             total_chars=total_chars,
             total_corrections=len(all_corrs),
+            total_ctc_blocks=total_ctc_blocks,
+            total_vlm_blocks=total_vlm_blocks,
             corrections=all_corrs[:200],
             stage_totals=stage_totals,
         )

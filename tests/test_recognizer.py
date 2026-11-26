@@ -10,12 +10,15 @@ from config.settings import Settings
 from src.inference import recognizer as rec_mod
 from src.inference.recognizer import (
     BinaNemotronRecognizer,
+    OpenAIVLMRecognizer,
     _bucket_by_resized_width,
     _patch_nemotron_cache_compat,
     _prepare_crop_orientation,
     _resolve_bina_paddle_dir,
     _split_wide_line,
+    check_model_available,
     create_recognizer,
+    create_vlm_recognizer,
 )
 
 
@@ -90,11 +93,15 @@ def test_create_recognizer_dispatches_by_variant(monkeypatch) -> None:
     create_recognizer(Settings(rec_model_variant="bina-0.2-rizehpizeh"))
     create_recognizer(Settings(rec_model_variant="bina-0.2-rizeh"))
     create_recognizer(Settings(rec_model_variant="bina-0.4-koochik"))
+    create_recognizer(Settings(rec_model_variant="hybrid", hybrid_ctc_variant="bina-0.2-rizeh"))
+    create_vlm_recognizer(Settings(rec_model_variant="hybrid"))
 
     assert seen == [
         "paddle:bina-0.2-rizehpizeh",
         "paddle:bina-0.2-rizeh",
         "nemotron:bina-0.4-koochik",
+        "paddle:hybrid",
+        "nemotron:hybrid",
     ]
 
 
@@ -174,3 +181,75 @@ def test_patch_nemotron_cache_compat_forwards_cache_kwarg() -> None:
     )
     assert res2["past_key_values"] is explicit_pkv
     assert seen == [("ids1", fake_cache, "px"), ("ids2", explicit_pkv, None)]
+
+
+def test_split_wide_line_default_preserves_normal_full_width_lines() -> None:
+    normal_wide = np.full((48, 1400, 3), 255, dtype=np.uint8)
+    assert len(_split_wide_line(normal_wide)) == 1
+
+
+def test_openai_vlm_recognizer_parses_response_and_handles_errors(monkeypatch) -> None:
+    import json
+    import urllib.error
+
+    s = Settings(
+        rec_model_variant="hybrid",
+        hybrid_vlm_variant="openai-vlm",
+        vlm_api_base_url="http://localhost:11434/v1/",
+        vlm_api_key="test-key",
+        vlm_model_name="qwen2.5vl:7b",
+    )
+    assert check_model_available("openai-vlm", s) if False else (s.vlm_api_base_url and s.vlm_model_name)
+
+    captured: dict = {}
+
+    class _FakeResp:
+        def __init__(self, body: str) -> None:
+            self._body = body.encode("utf-8")
+
+        def read(self) -> bytes:
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def _fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["auth"] = req.headers.get("Authorization")
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResp(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "```markdown\n| ردیف | شهر |\n| --- | --- |\n| ۱ | تهران |\n```"
+                            }
+                        }
+                    ]
+                }
+            )
+        )
+
+    monkeypatch.setattr(rec_mod.urllib.request, "urlopen", _fake_urlopen)
+    OpenAIVLMRecognizer.clear_cache()
+    vlm = create_vlm_recognizer(s)
+    assert isinstance(vlm, OpenAIVLMRecognizer)
+    crop = np.full((60, 200, 3), 240, dtype=np.uint8)
+    txt, conf = vlm.recognize_region(crop, block_type="table")
+    assert captured["url"] == "http://localhost:11434/v1/chat/completions"
+    assert captured["auth"] == "Bearer test-key"
+    assert captured["body"]["model"] == "qwen2.5vl:7b"
+    assert "| ۱ | تهران |" in txt
+    assert "```" not in txt
+    assert conf == 0.95
+
+    def _fail_urlopen(req, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(rec_mod.urllib.request, "urlopen", _fail_urlopen)
+    txt_err, conf_err = vlm.recognize_region(crop, block_type="text")
+    assert (txt_err, conf_err) == ("", 0.0)
