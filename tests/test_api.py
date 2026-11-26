@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import zipfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -180,3 +181,72 @@ def test_api_model_selection_config_and_output_serving(tmp_path: Path, monkeypat
         hyb_data = hyb_resp.json()
         assert hyb_data["model"] == "hybrid"
         assert hyb_data["observability"]["metadata"]["granularity"] == "hybrid"
+        assert "1" in hyb_data["page_images"]
+
+        img_resp = client.get(hyb_data["page_images"]["1"])
+        assert img_resp.status_code == 200
+        assert img_resp.headers["content-type"].startswith("image/jpeg")
+
+
+def test_ui_serving_save_edits_and_zip_export(tmp_path: Path, monkeypatch) -> None:
+    def _fake_pipeline_factory(settings: Settings, storage=None, engine=None):
+        s = settings.model_copy(update={"data_dir": tmp_path, "device": "cpu"})
+        return DocumentPipeline(
+            settings=s,
+            storage=LocalStorageBackend(tmp_path / "api_outputs"),
+            engine=_StubEngine(variant=s.rec_model_variant),  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(api_mod, "DocumentPipeline", _fake_pipeline_factory)
+    monkeypatch.setattr(api_mod, "_pipeline_instance", None)
+    monkeypatch.setattr(api_mod, "_active_model", "bina-0.2-rizeh")
+
+    with TestClient(api_mod.app) as client:
+        root_resp = client.get("/")
+        assert root_resp.status_code == 200
+        assert 'dir="rtl"' in root_resp.text
+        assert "Vazirmatn" in root_resp.text
+        assert "minimal-view" in root_resp.text
+        assert "debug-view" in root_resp.text
+
+        css_resp = client.get("/static/styles.css")
+        assert css_resp.status_code == 200
+        js_resp = client.get("/static/app.js")
+        assert js_resp.status_code == 200
+
+        ocr_resp = client.post(
+            "/ocr?model=bina-0.2-rizeh&out_format=html&out_format=md&out_format=txt&out_format=json",
+            files={"file": ("editable.png", _make_png_bytes(), "image/png")},
+        )
+        assert ocr_resp.status_code == 200
+        payload = ocr_resp.json()
+        doc = payload["result"]
+        doc["pages"][0]["blocks"][0]["text"] = "متن ویرایش‌شده توسط کاربر"
+
+        save_resp = client.post(
+            "/ocr/save",
+            json={
+                "document": doc,
+                "formats": ["html", "md", "txt", "json"],
+                "page_images": payload["page_images"],
+            },
+        )
+        assert save_resp.status_code == 200
+        saved = save_resp.json()
+        assert "متن ویرایش‌شده توسط کاربر" in saved["html"]
+        assert "متن ویرایش‌شده توسط کاربر" in saved["markdown"]
+        assert "متن ویرایش‌شده توسط کاربر" in saved["text"]
+        assert Path(saved["saved_files"]["html"]).read_text(encoding="utf-8") == saved["html"]
+
+        zip_resp = client.post(
+            "/outputs/zip",
+            json={"files": [saved["output_urls"]["html"], saved["output_urls"]["txt"]]},
+        )
+        assert zip_resp.status_code == 200
+        assert zip_resp.headers["content-type"] == "application/zip"
+        with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+            names = zf.namelist()
+            assert len(names) == 2
+
+        bad_zip = client.post("/outputs/zip", json={"files": ["../../etc/passwd"]})
+        assert bad_zip.status_code == 400

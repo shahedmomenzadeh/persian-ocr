@@ -47,6 +47,44 @@ class OutputManager:
         model_slug = sanitize_slug(model_variant)
         return f"{doc_slug}/{model_slug}/{doc_slug}__{model_slug}.{ext}"
 
+    @staticmethod
+    def page_image_key(
+        source_filename: str,
+        model_variant: str,
+        page_number: int,
+        output_prefix: str | None = None,
+    ) -> str:
+        """Return collision-free relative storage key for a preprocessed page JPEG preview."""
+        if output_prefix:
+            return f"{output_prefix}_pages/page_{page_number:03d}.jpg"
+        subdir = OutputManager.run_subdir(source_filename, model_variant)
+        return f"{subdir}/pages/page_{page_number:03d}.jpg"
+
+    def save_page_image(
+        self,
+        source_filename: str,
+        model_variant: str,
+        page_number: int,
+        bgr_img: Any,
+        output_prefix: str | None = None,
+    ) -> tuple[str, Path] | None:
+        """Encode a BGR page ndarray to JPEG and persist it for Debug UI layout visualization."""
+        if bgr_img is None or getattr(bgr_img, "size", 0) == 0:
+            return None
+        import cv2
+
+        ok, buf = cv2.imencode(".jpg", bgr_img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        if not ok:
+            return None
+        key = self.page_image_key(
+            source_filename=source_filename,
+            model_variant=model_variant,
+            page_number=page_number,
+            output_prefix=output_prefix,
+        )
+        saved_path = self.storage.save_bytes(key, buf.tobytes())
+        return key, saved_path
+
     def save_outputs(
         self,
         doc: DocumentResult,
@@ -54,6 +92,7 @@ class OutputManager:
         model_variant: str,
         output_prefix: str | None = None,
         save_manifest: bool = True,
+        page_images: dict[str, str] | None = None,
     ) -> dict[str, Path]:
         """Serialize and save requested formats plus an optional run manifest."""
         serializers = {
@@ -95,6 +134,7 @@ class OutputManager:
                 metadata=doc.metadata,
                 metrics=doc.metrics,
                 outputs=rel_outputs,
+                page_images=page_images or {},
             )
             if output_prefix:
                 manifest_key = f"{output_prefix}.manifest.json"

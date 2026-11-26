@@ -201,24 +201,32 @@ python -m src.cli run ./my_scans/ \
 
 ---
 
-## FastAPI Service
+## FastAPI Service & RTL Web UI
 
-Start the service in **single-worker mode** (safe for a single local GPU):
+Start the single-worker FastAPI server + Persian RTL Web UI (`Minimal` & `Debug` modes):
 
 ```bash
-uvicorn src.api:app --host 0.0.0.0 --port 8000 --workers 1
+python -m src.cli serve --host 0.0.0.0 --port 8000
+# or: uvicorn src.api:app --host 0.0.0.0 --port 8000 --workers 1
 ```
+
+Open `http://localhost:8000/` in your browser:
+- **Minimal Mode (`حالت مینیمال`)**: Drag-and-drop or browse files and entire folders (`PDF`, `PNG`, `JPG`, `TIFF`, `WebP`, `BMP`), track sequential processing, preview `HTML` / `Markdown` / `TXT` / `JSON`, copy or download individual files, or bundle everything into a `.zip`.
+- **Debug Mode (`حالت دیباگ و بازبینی`)**: Interactive SVG layout/line/table-cell overlay on preprocessed page images, per-block model trace badges (`CTC` vs `VLM`, `routing_reason`, confidence), stage timing bar charts, filterable spellcheck audit table, historical `/runs` browser, and live inline text/table editing with re-export via `POST /ocr/save`.
 
 ### Endpoints
 
 | Method & Path | Purpose |
 | --- | --- |
+| `GET /` | Persian RTL Web UI (`Minimal` & `Debug` modes) |
 | `GET /health` | Active model, default formats, spellcheck mode, GPU/VRAM/RSS telemetry, request count, `last_run` |
-| `GET /models` | List all 3 OCR models, granularity, disk availability, and active/loaded state |
+| `GET /models` | List all 4 OCR models, granularity, disk availability, and active/loaded state |
 | `POST /config` *(alias `/models/select`)* | Switch default `model`, `out_formats`, `spellcheck_mode`, and optionally `preload` weights |
-| `POST /ocr` *(alias `/process`)* | Upload a PDF/image, optionally override `?model=`, `?out_format=`, `?spellcheck=`, and save/return outputs |
-| `GET /runs` | List recent saved `manifest.json` run records newest-first |
-| `GET /outputs/{file_path}` | Download a saved artifact (`.html`, `.md`, `.txt`, `.json`) from `api_outputs` |
+| `POST /ocr` *(alias `/process`)* | Upload a PDF/image, run single-GPU OCR, save page previews + artifacts, and return results |
+| `POST /ocr/save` | Save inline-edited blocks/table cells back across `html`, `md`, `txt`, `json`, and `manifest.json` |
+| `POST /outputs/zip` | Bundle selected saved output files into an in-memory `.zip` download |
+| `GET /runs` | List recent saved `manifest.json` run records newest-first with `/outputs` URLs |
+| `GET /outputs/{file_path}` | Download a saved artifact (`.html`, `.md`, `.txt`, `.json`, `.jpg`) from `api_outputs` |
 
 ### `curl` Examples
 

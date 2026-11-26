@@ -1,10 +1,13 @@
-"""FastAPI service exposing /health, /models, /config, /ocr, /runs, and /outputs."""
+"""FastAPI service exposing the RTL Web UI plus /health, /models, /config, /ocr, /runs, and /outputs."""
 
 from __future__ import annotations
 
+import io
+import json
 import logging
 import tempfile
 import threading
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -12,13 +15,22 @@ from typing import Any
 import anyio
 import psutil
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from config.settings import RecognizerVariant, Settings, SpellcheckMode, configure_cache_env
 from src.inference.recognizer import check_model_available
 from src.pipeline import DocumentPipeline
-from src.postprocess.serializers import VALID_FORMATS, parse_formats, to_html, to_markdown, to_text
+from src.postprocess.serializers import (
+    VALID_FORMATS,
+    _cells_to_html_table,
+    parse_formats,
+    to_html,
+    to_markdown,
+    to_text,
+)
+from src.schemas.document import DocumentResult, TextLine
 from src.storage.local import LocalStorageBackend
 from src.storage.outputs import OutputManager
 
@@ -35,7 +47,12 @@ _MEDIA_TYPES = {
     ".md": "text/markdown; charset=utf-8",
     ".txt": "text/plain; charset=utf-8",
     ".json": "application/json; charset=utf-8",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
 }
+_UI_DIR = Path(__file__).resolve().parent / "ui"
+_UI_DIR.mkdir(parents=True, exist_ok=True)
 
 _pipeline_lock = threading.Lock()
 _pipeline_instance: DocumentPipeline | None = None
@@ -53,6 +70,21 @@ class ConfigUpdateRequest(BaseModel):
     out_formats: list[str] | str | None = None
     spellcheck_mode: SpellcheckMode | None = None
     preload: bool = False
+
+
+class SaveEditedDocumentRequest(BaseModel):
+    """Persist user-edited blocks/table cells back to HTML/MD/TXT/JSON and manifest."""
+
+    document: DocumentResult
+    model: str | None = None
+    formats: list[str] = Field(default_factory=lambda: ["html", "md", "txt", "json"])
+    page_images: dict[str, str] | None = None
+
+
+class ZipExportRequest(BaseModel):
+    """Relative output keys (or /outputs/... URLs) to bundle into a ZIP download."""
+
+    files: list[str]
 
 
 def get_pipeline(
@@ -103,6 +135,16 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.mount("/static", StaticFiles(directory=str(_UI_DIR)), name="static")
+
+
+@app.get("/", include_in_schema=False)
+def serve_ui() -> FileResponse:
+    """Serve the Persian RTL Studio UI (Minimal & Debug modes)."""
+    index_path = _UI_DIR / "index.html"
+    if not index_path.is_file():
+        raise HTTPException(status_code=404, detail="UI index.html not found.")
+    return FileResponse(path=index_path, media_type="text/html; charset=utf-8")
 
 
 def _check_cuda_available() -> bool:
@@ -302,8 +344,29 @@ async def process_document(
                 source_filename=filename,
                 save_outputs=save_outputs,
                 save_manifest=save_outputs,
+                save_page_images=save_outputs,
             )
         )
+
+        base_dir = getattr(pipeline.storage, "base_dir", None)
+        rel_outputs: dict[str, str] = {}
+        for fmt, path in written.items():
+            if base_dir is not None:
+                try:
+                    rel_outputs[fmt] = str(path.resolve().relative_to(Path(base_dir).resolve())).replace("\\", "/")
+                    continue
+                except ValueError:
+                    pass
+            rel_outputs[fmt] = str(path).replace("\\", "/")
+
+        page_image_urls = {
+            str(p): f"/outputs/{rel.lstrip('/')}"
+            for p, rel in getattr(pipeline, "last_page_images", {}).items()
+        }
+        output_urls = {
+            fmt: f"/outputs/{rel.lstrip('/')}"
+            for fmt, rel in rel_outputs.items()
+        }
 
         _total_requests += 1
         _last_run = {
@@ -324,6 +387,8 @@ async def process_document(
             "formats": requested,
             "result": doc_result.model_dump(),
             "saved_files": {k: str(v) for k, v in written.items()},
+            "output_urls": output_urls,
+            "page_images": page_image_urls,
             "observability": {
                 "metadata": doc_result.metadata.model_dump() if doc_result.metadata else None,
                 "metrics": doc_result.metrics.model_dump() if doc_result.metrics else None,
@@ -344,11 +409,189 @@ async def process_document(
             tmp_path.unlink(missing_ok=True)
 
 
+def _strip_outputs_prefix(key: str) -> str:
+    cleaned = key.strip().lstrip("/")
+    if cleaned.startswith("outputs/"):
+        return cleaned[len("outputs/") :]
+    return cleaned
+
+
+@app.post("/ocr/save")
+def save_edited_document(payload: SaveEditedDocumentRequest) -> dict[str, Any]:
+    """Persist user-edited OCR blocks and table cells across requested output formats."""
+    pipeline = get_pipeline()
+    try:
+        fmt_list = parse_formats(payload.formats, default=("html", "md", "txt", "json"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    doc = payload.document
+    target_model = (
+        payload.model
+        or (doc.metadata.rec_model_variant if doc.metadata else None)
+        or pipeline.settings.rec_model_variant
+    )
+
+    updated_pages = []
+    for page in doc.pages:
+        updated_blocks = []
+        for blk in page.blocks:
+            if blk.cells:
+                updated_html = _cells_to_html_table(blk.cells)
+                rows_by_idx: dict[int, list[str]] = {}
+                for cell in blk.cells:
+                    if cell.text.strip():
+                        rows_by_idx.setdefault(cell.row_start, []).append(cell.text.strip())
+                rebuilt_text = "\n".join(
+                    " ".join(rows_by_idx[r]) for r in sorted(rows_by_idx.keys())
+                )
+                updated_lines = [
+                    TextLine(text=c.text, bbox=c.bbox, confidence=c.confidence)
+                    for c in blk.cells
+                    if c.text.strip()
+                ]
+                updated_blocks.append(
+                    blk.model_copy(
+                        update={
+                            "html": updated_html,
+                            "text": rebuilt_text,
+                            "lines": updated_lines,
+                        }
+                    )
+                )
+            else:
+                new_text = blk.text or ""
+                split_lines = [ln for ln in new_text.splitlines()]
+                if blk.lines and len(split_lines) == len(blk.lines):
+                    new_lines = [
+                        ln.model_copy(update={"text": txt})
+                        for ln, txt in zip(blk.lines, split_lines)
+                    ]
+                elif new_text.strip():
+                    new_lines = [
+                        TextLine(text=ln, bbox=blk.bbox, confidence=blk.confidence)
+                        for ln in split_lines
+                        if ln.strip()
+                    ]
+                else:
+                    new_lines = []
+                updated_blocks.append(blk.model_copy(update={"text": new_text, "lines": new_lines}))
+        updated_pages.append(page.model_copy(update={"blocks": updated_blocks}))
+
+    updated_metrics = doc.metrics
+    if updated_metrics is not None:
+        updated_metrics = updated_metrics.model_copy(
+            update={
+                "total_chars": sum(sum(len(b.text) for b in p.blocks) for p in updated_pages),
+                "total_lines": sum(sum(len(b.lines) for b in p.blocks) for p in updated_pages),
+            }
+        )
+
+    edited_doc = doc.model_copy(update={"pages": updated_pages, "metrics": updated_metrics})
+    out_mgr = OutputManager(pipeline.storage)
+
+    page_images_rel: dict[str, str] = {}
+    if payload.page_images:
+        page_images_rel = {
+            str(k): _strip_outputs_prefix(v) for k, v in payload.page_images.items()
+        }
+    else:
+        manifest_key = f"{out_mgr.run_subdir(edited_doc.source_filename, target_model)}/manifest.json"
+        try:
+            if pipeline.storage.exists(manifest_key):
+                existing = json.loads(pipeline.storage.resolve_path(manifest_key).read_text(encoding="utf-8"))
+                page_images_rel = {
+                    str(k): str(v) for k, v in (existing.get("page_images") or {}).items()
+                }
+        except Exception:
+            page_images_rel = {}
+
+    written = out_mgr.save_outputs(
+        doc=edited_doc,
+        formats=fmt_list,
+        model_variant=target_model,
+        save_manifest=True,
+        page_images=page_images_rel,
+    )
+
+    base_dir = getattr(pipeline.storage, "base_dir", None)
+    output_urls: dict[str, str] = {}
+    for fmt, path in written.items():
+        if base_dir is not None:
+            try:
+                rel = str(path.resolve().relative_to(Path(base_dir).resolve())).replace("\\", "/")
+                output_urls[fmt] = f"/outputs/{rel}"
+                continue
+            except ValueError:
+                pass
+        output_urls[fmt] = f"/outputs/{path.name}"
+
+    return {
+        "status": "ok",
+        "doc_id": edited_doc.doc_id,
+        "model": target_model,
+        "formats": fmt_list,
+        "saved_files": {k: str(v) for k, v in written.items()},
+        "output_urls": output_urls,
+        "page_images": {p: f"/outputs/{rel.lstrip('/')}" for p, rel in page_images_rel.items()},
+        "result": edited_doc.model_dump(),
+        "html": to_html(edited_doc),
+        "markdown": to_markdown(edited_doc),
+        "text": to_text(edited_doc),
+    }
+
+
+@app.post("/outputs/zip")
+def download_outputs_zip(payload: ZipExportRequest) -> StreamingResponse:
+    """Bundle selected saved artifacts safely into an in-memory ZIP archive."""
+    if not payload.files:
+        raise HTTPException(status_code=400, detail="No files specified for ZIP export.")
+    pipeline = get_pipeline()
+    base_dir = Path(pipeline.storage.base_dir).resolve()
+
+    buf = io.BytesIO()
+    added = 0
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        seen_names: set[str] = set()
+        for raw_key in payload.files:
+            rel_key = _strip_outputs_prefix(raw_key)
+            try:
+                target = pipeline.storage.resolve_path(rel_key)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if not target.is_file():
+                continue
+            arcname = str(target.resolve().relative_to(base_dir)).replace("\\", "/")
+            if arcname not in seen_names:
+                zf.write(target, arcname=arcname)
+                seen_names.add(arcname)
+                added += 1
+
+    if added == 0:
+        raise HTTPException(status_code=404, detail="None of the requested output files were found.")
+
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="persian-ocr-outputs.zip"'},
+    )
+
+
 @app.get("/runs")
 def list_runs(limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
-    """List saved OCR run manifests newest-first."""
+    """List saved OCR run manifests newest-first with direct /outputs URLs."""
     pipeline = get_pipeline()
     runs = OutputManager(pipeline.storage).list_manifests(limit=limit)
+    for run in runs:
+        outputs = run.get("outputs") or {}
+        run["output_urls"] = {
+            fmt: f"/outputs/{str(rel).lstrip('/')}" for fmt, rel in outputs.items()
+        }
+        pimgs = run.get("page_images") or {}
+        run["page_image_urls"] = {
+            str(p): f"/outputs/{str(rel).lstrip('/')}" for p, rel in pimgs.items()
+        }
     return {"count": len(runs), "runs": runs}
 
 

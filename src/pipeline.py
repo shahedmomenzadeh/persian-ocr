@@ -55,6 +55,7 @@ class DocumentPipeline:
         configure_cache_env(self.settings.models_dir)
         self.storage: StorageBackend = storage or LocalStorageBackend(self.settings.data_dir)
         self._engine = engine
+        self.last_page_images: dict[str, str] = {}
 
     @property
     def engine(self) -> InferenceEngine:
@@ -306,6 +307,7 @@ class DocumentPipeline:
         source_filename: str | None = None,
         save_outputs: bool = True,
         save_manifest: bool = True,
+        save_page_images: bool = False,
     ) -> tuple[DocumentResult, dict[str, Path]]:
         """Run end-to-end OCR on a PDF or image file and persist requested outputs."""
         src_path = Path(input_path)
@@ -316,6 +318,9 @@ class DocumentPipeline:
         pages: list[PageResult] = []
         all_corrections: list[SpellcheckCorrection] = []
         doc_id = uuid.uuid4().hex[:12]
+        saved_page_images: dict[str, str] = {}
+        self.last_page_images = {}
+        out_mgr = OutputManager(self.storage) if save_outputs else None
 
         for page_input in load_document_pages(src_path, dpi=self.settings.dpi):
             if (
@@ -331,6 +336,24 @@ class DocumentPipeline:
                 )
                 post_sec = round(time.perf_counter() - t_nat0, 3)
                 rss_mb = round(psutil.Process().memory_info().rss / (1024 * 1024), 2)
+                if out_mgr is not None and save_page_images:
+                    import cv2
+                    import numpy as np
+
+                    nat_bgr = cv2.cvtColor(
+                        np.asarray(page_input.image.convert("RGB"), dtype=np.uint8),
+                        cv2.COLOR_RGB2BGR,
+                    )
+                    saved_img = out_mgr.save_page_image(
+                        source_filename=effective_name,
+                        model_variant=self.settings.rec_model_variant,
+                        page_number=page_input.page_number,
+                        bgr_img=nat_bgr,
+                        output_prefix=output_prefix,
+                    )
+                    del nat_bgr
+                    if saved_img is not None:
+                        saved_page_images[str(page_input.page_number)] = saved_img[0]
                 page_res = PageResult(
                     page_number=page_input.page_number,
                     width=w,
@@ -370,6 +393,16 @@ class DocumentPipeline:
 
                 try:
                     raw_page = self.engine.process_page(page_input.page_number, bgr_img)
+                    if out_mgr is not None and save_page_images:
+                        saved_img = out_mgr.save_page_image(
+                            source_filename=effective_name,
+                            model_variant=self.settings.rec_model_variant,
+                            page_number=page_input.page_number,
+                            bgr_img=bgr_img,
+                            output_prefix=output_prefix,
+                        )
+                        if saved_img is not None:
+                            saved_page_images[str(page_input.page_number)] = saved_img[0]
                 finally:
                     del bgr_img
 
@@ -416,15 +449,16 @@ class DocumentPipeline:
         )
 
         written: dict[str, Path] = {}
-        if save_outputs and requested_formats:
-            out_mgr = OutputManager(self.storage)
+        if out_mgr is not None and requested_formats:
             written = out_mgr.save_outputs(
                 doc=doc_result,
                 formats=requested_formats,
                 model_variant=self.settings.rec_model_variant,
                 output_prefix=output_prefix,
                 save_manifest=save_manifest,
+                page_images=saved_page_images,
             )
+        self.last_page_images = dict(saved_page_images)
 
         logger.info(
             "Completed doc_id=%s file=%s model=%s pages=%d in %.2fs | "

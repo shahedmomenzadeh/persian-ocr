@@ -187,5 +187,17 @@ def run(
                 pipeline.unload()
 
 
+@app.command()
+def serve(
+    host: str = typer.Option("0.0.0.0", "--host", help="Bind host for the FastAPI UI server."),
+    port: int = typer.Option(8000, "--port", help="Bind port for the FastAPI UI server."),
+) -> None:
+    """Start the Persian OCR Studio Web UI and FastAPI service (single worker)."""
+    import uvicorn
+
+    typer.echo(f"Starting Persian OCR Studio UI at http://{host}:{port}/")
+    uvicorn.run("src.api:app", host=host, port=port, workers=1)
+
+
 if __name__ == "__main__":
     app()

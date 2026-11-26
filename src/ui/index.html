@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>بینا OCR استودیو — سامانه پردازش اسناد فارسی</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css?v=3">
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Navigation Bar -->
+    <header class="topbar">
+      <div class="topbar-brand">
+        <div class="brand-logo" aria-hidden="true">ب</div>
+        <div>
+          <h1 class="brand-title">بینا OCR استودیو</h1>
+          <p class="brand-sub">تشخیص متن، جداول و چیدمان اسناد فارسی (RTL)</p>
+        </div>
+      </div>
+
+      <nav class="mode-switcher" role="tablist" aria-label="حالت رابط کاربری">
+        <button id="btn-mode-minimal" class="mode-btn active" type="button" role="tab" aria-selected="true">
+          حالت مینیمال
+        </button>
+        <button id="btn-mode-debug" class="mode-btn" type="button" role="tab" aria-selected="false">
+          حالت دیباگ و بازبینی
+        </button>
+      </nav>
+
+      <div class="topbar-controls">
+        <label class="control-group">
+          <span>مدل تشخیص:</span>
+          <select id="select-model">
+            <option value="bina-0.2-rizeh">Bina-0.2-Rizeh (پیش‌فرض سریع)</option>
+            <option value="bina-0.2-rizehpizeh">Bina-0.2-RizehPizeh</option>
+            <option value="bina-0.4-koochik">Bina-0.4-Koochik (VLM)</option>
+            <option value="hybrid">Hybrid (CTC + VLM)</option>
+          </select>
+        </label>
+        <label class="control-group">
+          <span>اصلاح املایی:</span>
+          <select id="select-spellcheck">
+            <option value="kenlm">KenLM 5-gram</option>
+            <option value="lexicon">واژه‌نامه بصری</option>
+            <option value="off">خاموش</option>
+          </select>
+        </label>
+        <div id="health-pill" class="health-pill" title="وضعیت سرویس و سخت‌افزار">
+          <span class="status-dot"></span>
+          <span id="health-text" dir="ltr">Checking...</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- MINIMAL MODE VIEW -->
+    <main id="minimal-view" class="view-container">
+      <section class="card minimal-upload-card">
+        <div class="card-header">
+          <div>
+            <h2>بارگذاری و پردازش سریع اسناد</h2>
+            <p class="muted">فایل PDF، تصویر یا یک پوشه کامل از اسناد را رها کنید یا انتخاب نمایید.</p>
+          </div>
+          <div class="format-selector" aria-label="فرمت‌های خروجی">
+            <span class="format-label">فرمت‌های خروجی:</span>
+            <label class="chip-check"><input type="checkbox" name="min-format" value="html" checked> HTML</label>
+            <label class="chip-check"><input type="checkbox" name="min-format" value="md" checked> Markdown</label>
+            <label class="chip-check"><input type="checkbox" name="min-format" value="txt" checked> TXT</label>
+            <label class="chip-check"><input type="checkbox" name="min-format" value="json" checked> JSON</label>
+          </div>
+        </div>
+
+        <div id="minimal-dropzone" class="dropzone" tabindex="0">
+          <div class="dropzone-icon">📄</div>
+          <div class="dropzone-title">فایل‌ها یا پوشه اسناد را اینجا بکشید و رها کنید</div>
+          <div class="dropzone-sub">پشتیبانی از <span dir="ltr">PDF, PNG, JPG, TIFF, WebP, BMP</span></div>
+          <div class="dropzone-actions">
+            <button id="btn-pick-files" class="btn btn-primary" type="button">انتخاب فایل‌ها</button>
+            <button id="btn-pick-folder" class="btn btn-secondary" type="button">انتخاب پوشه</button>
+          </div>
+          <input id="input-files" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp" hidden>
+          <input id="input-folder" type="file" webkitdirectory directory multiple hidden>
+        </div>
+
+        <div id="minimal-queue-panel" class="queue-panel hidden">
+          <div class="queue-toolbar">
+            <div class="queue-stats">
+              <strong id="minimal-queue-summary">۰ فایل در صف</strong>
+              <span id="minimal-progress-label" class="muted"></span>
+            </div>
+            <div class="queue-buttons">
+              <button id="btn-run-queue" class="btn btn-primary" type="button">شروع پردازش</button>
+              <button id="btn-clear-queue" class="btn btn-ghost" type="button">پاک کردن لیست</button>
+            </div>
+          </div>
+          <div class="progress-track">
+            <div id="minimal-progress-bar" class="progress-fill" style="width: 0%"></div>
+          </div>
+          <ul id="minimal-queue-list" class="queue-list"></ul>
+        </div>
+      </section>
+
+      <section id="minimal-results-panel" class="card minimal-results-card hidden">
+        <div class="results-top">
+          <div id="minimal-doc-tabs" class="doc-tabs" aria-label="اسناد پردازش‌شده"></div>
+          <div class="results-actions">
+            <button id="btn-open-in-debug" class="btn btn-secondary" type="button">باز کردن در حالت دیباگ</button>
+            <button id="btn-copy-active" class="btn btn-ghost" type="button">کپی خروجی</button>
+            <div id="minimal-download-links" class="download-links"></div>
+            <button id="btn-download-zip" class="btn btn-primary" type="button">دانلود همه (ZIP)</button>
+          </div>
+        </div>
+
+        <div id="minimal-preview-tabs" class="subtabs">
+          <button class="subtab active" data-fmt="html" type="button">پیش‌نمایش HTML</button>
+          <button class="subtab" data-fmt="md" type="button">Markdown</button>
+          <button class="subtab" data-fmt="txt" type="button">متن ساده (TXT)</button>
+          <button class="subtab" data-fmt="json" type="button">ساختار JSON</button>
+        </div>
+
+        <div class="preview-body">
+          <div id="minimal-html-frame" class="html-preview-box" role="region" aria-label="پیش‌نمایش خروجی HTML"></div>
+          <pre id="minimal-code-preview" class="code-preview hidden"></pre>
+        </div>
+      </section>
+    </main>
+
+    <!-- DEBUG MODE VIEW -->
+    <main id="debug-view" class="view-container hidden">
+      <section class="card debug-toolbar-card">
+        <div class="debug-toolbar-row">
+          <div class="debug-source-controls">
+            <button id="btn-debug-upload" class="btn btn-primary" type="button">پردازش و بازبینی فایل جدید</button>
+            <input id="input-debug-file" type="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp" hidden>
+
+            <label class="history-select-wrap">
+              <span>یا بارگذاری اجرای ذخیره‌شده:</span>
+              <select id="select-history-run">
+                <option value="">— انتخاب از تاریخچه اجراها —</option>
+              </select>
+            </label>
+            <button id="btn-refresh-runs" class="btn btn-ghost" type="button" title="به‌روزرسانی لیست اجراها">↻</button>
+          </div>
+
+          <div id="debug-status-note" class="muted"></div>
+        </div>
+
+        <div id="debug-kpi-strip" class="kpi-strip hidden"></div>
+      </section>
+
+      <div id="debug-empty-state" class="card empty-state">
+        <div class="empty-icon">🔍</div>
+        <h3>محیط دیباگ، ردیابی مدل‌ها و ویرایش متن</h3>
+        <p class="muted">
+          برای مشاهده جعبه‌های چیدمان (Layout)، خطوط و سلول‌های جدول روی تصویر صفحه، ردیابی اینکه کدام مدل (`CTC` یا `VLM`) هر بخش را پردازش کرده و ویرایش مستقیم خروجی‌ها، یک فایل را پردازش کنید یا یکی از اجراهای قبلی را انتخاب نمایید.
+        </p>
+      </div>
+
+      <section id="debug-workbench" class="debug-workbench hidden">
+        <!-- Visual Layout Canvas Pane -->
+        <div class="card inspector-pane">
+          <div class="pane-toolbar">
+            <div class="page-nav">
+              <button id="btn-prev-page" class="btn btn-ghost btn-sm" type="button">صفحه قبل</button>
+              <span id="page-indicator" class="page-indicator">صفحه ۱ از ۱</span>
+              <button id="btn-next-page" class="btn btn-ghost btn-sm" type="button">صفحه بعد</button>
+            </div>
+
+            <div class="layer-toggles">
+              <label class="chip-check"><input id="toggle-blocks" type="checkbox" checked> بلوک‌ها</label>
+              <label class="chip-check"><input id="toggle-lines" type="checkbox"> خطوط</label>
+              <label class="chip-check"><input id="toggle-cells" type="checkbox"> سلول‌ها</label>
+              <label class="chip-check"><input id="toggle-labels" type="checkbox" checked> برچسب‌ها</label>
+            </div>
+
+            <div class="zoom-controls" dir="ltr">
+              <button id="btn-zoom-out" class="btn btn-ghost btn-sm" type="button">−</button>
+              <span id="zoom-label">Fit</span>
+              <button id="btn-zoom-in" class="btn btn-ghost btn-sm" type="button">+</button>
+              <button id="btn-zoom-fit" class="btn btn-ghost btn-sm" type="button">Fit</button>
+            </div>
+          </div>
+
+          <div class="legend-bar">
+            <span class="legend-item"><i class="swatch swatch-title"></i>عنوان (title)</span>
+            <span class="legend-item"><i class="swatch swatch-text"></i>متن (text)</span>
+            <span class="legend-item"><i class="swatch swatch-table"></i>جدول (table)</span>
+            <span class="legend-item"><i class="swatch swatch-header"></i>سربرگ (header)</span>
+            <span class="legend-item"><i class="swatch swatch-footer"></i>پاورقی (footer)</span>
+            <span class="legend-item"><i class="swatch swatch-figure"></i>تصویر (figure)</span>
+          </div>
+
+          <div id="canvas-viewport" class="canvas-viewport">
+            <div id="canvas-stage" class="canvas-stage">
+              <img id="debug-page-img" alt="تصویر صفحه سند" class="page-img">
+              <svg id="debug-svg-overlay" class="svg-overlay"></svg>
+            </div>
+            <div id="svg-tooltip" class="svg-tooltip hidden" dir="rtl"></div>
+          </div>
+        </div>
+
+        <!-- Traces, Reports & Editor Pane -->
+        <div class="card details-pane">
+          <div id="debug-tab-buttons" class="subtabs">
+            <button class="subtab active" data-tab="editor" type="button">ویرایش و ردیابی بلوک‌ها</button>
+            <button class="subtab" data-tab="traces" type="button">گزارش مراحل و کارایی</button>
+            <button class="subtab" data-tab="spellcheck" type="button">گزارش اصلاح املایی</button>
+            <button class="subtab" data-tab="outputs" type="button">خروجی زنده</button>
+          </div>
+
+          <!-- Tab 1: Block Editor & Model Traces -->
+          <div id="tab-editor" class="tab-panel active">
+            <div class="editor-sticky-bar">
+              <div class="editor-left-actions">
+                <span id="edit-dirty-badge" class="dirty-badge clean">بدون تغییر</span>
+                <label class="filter-inline">
+                  <span>فیلتر بلوک:</span>
+                  <select id="block-filter-select">
+                    <option value="all">همه بلوک‌ها</option>
+                    <option value="ctc">فقط CTC</option>
+                    <option value="vlm">فقط VLM</option>
+                    <option value="table">فقط جداول</option>
+                  </select>
+                </label>
+                <label class="chip-check" title="تبدیل خودکار اعداد تایپ‌شده به ارقام فارسی (۰-۹)">
+                  <input id="toggle-persian-digits" type="checkbox" checked> ارقام فارسی (۰-۹)
+                </label>
+              </div>
+              <div class="editor-right-actions">
+                <button id="btn-revert-edits" class="btn btn-ghost btn-sm" type="button" disabled>بازگردانی</button>
+                <button id="btn-save-edits" class="btn btn-primary btn-sm" type="button">ذخیره تغییرات</button>
+              </div>
+            </div>
+            <div id="debug-download-bar" class="debug-download-bar"></div>
+            <div id="block-editor-list" class="block-editor-list"></div>
+          </div>
+
+          <!-- Tab 2: Stage Timings, Provenance & Model Traces -->
+          <div id="tab-traces" class="tab-panel hidden">
+            <div id="traces-content" class="traces-content"></div>
+          </div>
+
+          <!-- Tab 3: Spellcheck Audit -->
+          <div id="tab-spellcheck" class="tab-panel hidden">
+            <div id="spellcheck-content" class="spellcheck-content"></div>
+          </div>
+
+          <!-- Tab 4: Live Rendered Outputs -->
+          <div id="tab-outputs" class="tab-panel hidden">
+            <div id="debug-output-subtabs" class="subtabs">
+              <button class="subtab active" data-fmt="html" type="button">پیش‌نمایش HTML</button>
+              <button class="subtab" data-fmt="md" type="button">Markdown</button>
+              <button class="subtab" data-fmt="txt" type="button">TXT</button>
+              <button class="subtab" data-fmt="json" type="button">JSON</button>
+            </div>
+            <div class="preview-body">
+              <div id="debug-live-html" class="html-preview-box" role="region" aria-label="پیش‌نمایش HTML ویرایش‌شده"></div>
+              <pre id="debug-live-pre" class="code-preview hidden"></pre>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+  <script src="/static/app.js?v=3" defer></script>
+</body>
+</html>

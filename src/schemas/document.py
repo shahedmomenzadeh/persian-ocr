@@ -155,3 +155,4 @@ class RunManifest(BaseModel):
     metadata: RunMetadata | None = None
     metrics: DocumentMetrics | None = None
     outputs: dict[str, str] = Field(default_factory=dict)
+    page_images: dict[str, str] = Field(default_factory=dict)
