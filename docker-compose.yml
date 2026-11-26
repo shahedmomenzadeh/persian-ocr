@@ -1,0 +1,47 @@
+services:
+  ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PADDLE_FLAVOR: ${PADDLE_FLAVOR:-gpu}
+        INSTALL_EXTRAS: ${INSTALL_EXTRAS:-nemotron,kenlm}
+    container_name: persian-ocr-studio
+    ports:
+      - "${OCR_PORT:-8000}:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DEVICE: ${DEVICE:-gpu}
+      AUTO_DOWNLOAD_MODELS: ${AUTO_DOWNLOAD_MODELS:-true}
+      DOWNLOAD_MODELS: ${DOWNLOAD_MODELS:-}
+      DATA_DIR: /app/data
+      MODELS_DIR: /app/models
+      CACHE_DIR: /app/models/cache
+      BINA_MODEL_DIR: /app/models/bina-0.2
+      BINA_RIZEH_MODEL_DIR: /app/models/bina-0.2-rizeh
+      BINA_KOOCHIK_MODEL_DIR: /app/models/bina-0.4-koochik
+      SPELLCHECK_KENLM_PATH: /app/models/kenlm/persian_5gram_4bit.binary
+      HF_HOME: /app/models/cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /app/models/cache/huggingface/hub
+      PADDLE_PDX_CACHE_HOME: /app/models/cache/paddlex
+      PADDLEX_HOME: /app/models/cache/paddlex
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    shm_size: "2gb"
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

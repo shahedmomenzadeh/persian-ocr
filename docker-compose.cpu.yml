@@ -1,0 +1,12 @@
+services:
+  ocr:
+    build:
+      args:
+        PADDLE_FLAVOR: cpu
+        INSTALL_EXTRAS: ${INSTALL_EXTRAS:-kenlm}
+    environment:
+      DEVICE: cpu
+    deploy:
+      resources:
+        reservations:
+          devices: !reset []

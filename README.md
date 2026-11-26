@@ -76,7 +76,13 @@ persian-OCR/
 │   ├── schemas/               # Canonical DocumentResult, PageMetrics, StageTimings, RunManifest
 │   └── storage/               # StorageBackend protocol, LocalStorageBackend, OutputManager
 ├── tests/                     # Pytest unit & integration suites
+├── docker/
+│   └── entrypoint.sh          # Runtime NVIDIA lib path setup & first-run model downloader
+├── .dockerignore
 ├── .env.example               # Default environment configuration
+├── Dockerfile                 # Local uv-based image (GPU CUDA 12.6 or CPU)
+├── docker-compose.yml         # GPU Compose setup mounting ./models and ./data
+├── docker-compose.cpu.yml     # CPU-only Compose override
 └── pyproject.toml             # Core & optional ([nemotron], [kenlm], [dev]) dependencies
 ```
 
@@ -147,6 +153,40 @@ python scripts/download_models.py --model all
 
 # Verify existing weights and CUDA runtimes without downloading:
 python scripts/download_models.py --model all --verify-only
+```
+
+---
+
+### Alternative Setup: Docker Compose (Local Build, No Hub Image)
+
+If you prefer Docker to handle Python, system libraries, and model initialization automatically alongside the `uv` setup above, the `Dockerfile` builds locally on your machine and mounts `./models` and `./data` directly from the host:
+
+```bash
+# Optional: customize pipeline settings before starting
+cp .env.example .env
+
+# Build locally & start the Web UI + API server on http://localhost:8000 (NVIDIA GPU)
+docker compose up --build
+```
+
+> **Note:** GPU mode requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) installed on the host.
+
+For **CPU-only environments** (skips CUDA wheels and GPU device reservation):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.cpu.yml up --build
+```
+
+Useful Docker Compose commands:
+
+```bash
+# On first start, AUTO_DOWNLOAD_MODELS=true automatically downloads missing weights
+# required by REC_MODEL_VARIANT and SPELLCHECK_MODE into ./models.
+# To pre-download all models at once:
+docker compose run --rm ocr python scripts/download_models.py --model all
+
+# Run the CLI inside the container using host ./data and ./models:
+docker compose run --rm ocr python -m src.cli run data/test_5page.pdf --model bina-0.2-rizeh
 ```
 
 ---
